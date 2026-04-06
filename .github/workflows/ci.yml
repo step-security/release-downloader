@@ -1,0 +1,85 @@
+name: 'Build and Test'
+on:
+  # Trigger manually
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: ${{ github.actor == 'dependabot[bot]' && fromJson('["ubuntu-latest"]') || fromJson('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v6
+
+      - name: Setup node and cache dependencies
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+
+      - name: Build and test
+        shell: bash
+        run: |
+          npm ci
+          npm run all
+
+      - name: Run action
+        uses: ./
+        id: download-public
+        with:
+          repository: 'step-security/setup-terraform'
+          tag: 'v4.0.0'
+          fileName: 'provenance.json'
+          tarBall: true
+          zipBall: true
+          out-file-path: './test-downloads'
+
+      - name: List downloaded files
+        shell: bash
+        run: ls -lrth test-downloads
+
+      - name: Download tarBall & zipBall only
+        uses: ./
+        with:
+          repository: 'step-security/setup-terraform'
+          tag: 'v4.0.0'
+          tarBall: true
+          zipBall: true
+          out-file-path: './public-download'
+
+      - name: List downloaded files
+        shell: bash
+        run: ls -lrth public-download
+
+      - name: Download all assets with wildcard
+        uses: ./
+        with:
+          repository: 'step-security/setup-terraform'
+          tag: 'v4.0.0'
+          fileName: '*'
+          out-file-path: './all-downloads'
+
+      - name: List downloaded files
+        shell: bash
+        run: ls -lrth all-downloads
+
+      - name: Read output variable set by previous steps
+        shell: bash
+        env:
+          PUBLIC_TAG: ${{ steps.download-public.outputs.tag_name }}
+          DOWNLOADED_FILES: ${{ steps.download-public.outputs.downloaded_files }}
+        run: |
+          if [ -n "$PUBLIC_TAG" ]; then
+            echo "$PUBLIC_TAG"
+          else echo "Unable to read output variable from step download-public"; exit 1
+          fi
+
+          echo "Downloaded files:"
+          echo "$DOWNLOADED_FILES"
