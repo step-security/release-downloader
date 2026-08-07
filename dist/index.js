@@ -3182,6 +3182,241 @@ function copyFile(srcFile, destFile, force) {
 
 /***/ }),
 
+/***/ 8207:
+/***/ (function(module, __unused_webpack_exports, __nccwpck_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+const events_1 = __nccwpck_require__(4434);
+const debug_1 = __importDefault(__nccwpck_require__(2830));
+const promisify_1 = __importDefault(__nccwpck_require__(8067));
+const debug = debug_1.default('agent-base');
+function isAgent(v) {
+    return Boolean(v) && typeof v.addRequest === 'function';
+}
+function isSecureEndpoint() {
+    const { stack } = new Error();
+    if (typeof stack !== 'string')
+        return false;
+    return stack.split('\n').some(l => l.indexOf('(https.js:') !== -1 || l.indexOf('node:https:') !== -1);
+}
+function createAgent(callback, opts) {
+    return new createAgent.Agent(callback, opts);
+}
+(function (createAgent) {
+    /**
+     * Base `http.Agent` implementation.
+     * No pooling/keep-alive is implemented by default.
+     *
+     * @param {Function} callback
+     * @api public
+     */
+    class Agent extends events_1.EventEmitter {
+        constructor(callback, _opts) {
+            super();
+            let opts = _opts;
+            if (typeof callback === 'function') {
+                this.callback = callback;
+            }
+            else if (callback) {
+                opts = callback;
+            }
+            // Timeout for the socket to be returned from the callback
+            this.timeout = null;
+            if (opts && typeof opts.timeout === 'number') {
+                this.timeout = opts.timeout;
+            }
+            // These aren't actually used by `agent-base`, but are required
+            // for the TypeScript definition files in `@types/node` :/
+            this.maxFreeSockets = 1;
+            this.maxSockets = 1;
+            this.maxTotalSockets = Infinity;
+            this.sockets = {};
+            this.freeSockets = {};
+            this.requests = {};
+            this.options = {};
+        }
+        get defaultPort() {
+            if (typeof this.explicitDefaultPort === 'number') {
+                return this.explicitDefaultPort;
+            }
+            return isSecureEndpoint() ? 443 : 80;
+        }
+        set defaultPort(v) {
+            this.explicitDefaultPort = v;
+        }
+        get protocol() {
+            if (typeof this.explicitProtocol === 'string') {
+                return this.explicitProtocol;
+            }
+            return isSecureEndpoint() ? 'https:' : 'http:';
+        }
+        set protocol(v) {
+            this.explicitProtocol = v;
+        }
+        callback(req, opts, fn) {
+            throw new Error('"agent-base" has no default implementation, you must subclass and override `callback()`');
+        }
+        /**
+         * Called by node-core's "_http_client.js" module when creating
+         * a new HTTP request with this Agent instance.
+         *
+         * @api public
+         */
+        addRequest(req, _opts) {
+            const opts = Object.assign({}, _opts);
+            if (typeof opts.secureEndpoint !== 'boolean') {
+                opts.secureEndpoint = isSecureEndpoint();
+            }
+            if (opts.host == null) {
+                opts.host = 'localhost';
+            }
+            if (opts.port == null) {
+                opts.port = opts.secureEndpoint ? 443 : 80;
+            }
+            if (opts.protocol == null) {
+                opts.protocol = opts.secureEndpoint ? 'https:' : 'http:';
+            }
+            if (opts.host && opts.path) {
+                // If both a `host` and `path` are specified then it's most
+                // likely the result of a `url.parse()` call... we need to
+                // remove the `path` portion so that `net.connect()` doesn't
+                // attempt to open that as a unix socket file.
+                delete opts.path;
+            }
+            delete opts.agent;
+            delete opts.hostname;
+            delete opts._defaultAgent;
+            delete opts.defaultPort;
+            delete opts.createConnection;
+            // Hint to use "Connection: close"
+            // XXX: non-documented `http` module API :(
+            req._last = true;
+            req.shouldKeepAlive = false;
+            let timedOut = false;
+            let timeoutId = null;
+            const timeoutMs = opts.timeout || this.timeout;
+            const onerror = (err) => {
+                if (req._hadError)
+                    return;
+                req.emit('error', err);
+                // For Safety. Some additional errors might fire later on
+                // and we need to make sure we don't double-fire the error event.
+                req._hadError = true;
+            };
+            const ontimeout = () => {
+                timeoutId = null;
+                timedOut = true;
+                const err = new Error(`A "socket" was not created for HTTP request before ${timeoutMs}ms`);
+                err.code = 'ETIMEOUT';
+                onerror(err);
+            };
+            const callbackError = (err) => {
+                if (timedOut)
+                    return;
+                if (timeoutId !== null) {
+                    clearTimeout(timeoutId);
+                    timeoutId = null;
+                }
+                onerror(err);
+            };
+            const onsocket = (socket) => {
+                if (timedOut)
+                    return;
+                if (timeoutId != null) {
+                    clearTimeout(timeoutId);
+                    timeoutId = null;
+                }
+                if (isAgent(socket)) {
+                    // `socket` is actually an `http.Agent` instance, so
+                    // relinquish responsibility for this `req` to the Agent
+                    // from here on
+                    debug('Callback returned another Agent instance %o', socket.constructor.name);
+                    socket.addRequest(req, opts);
+                    return;
+                }
+                if (socket) {
+                    socket.once('free', () => {
+                        this.freeSocket(socket, opts);
+                    });
+                    req.onSocket(socket);
+                    return;
+                }
+                const err = new Error(`no Duplex stream was returned to agent-base for \`${req.method} ${req.path}\``);
+                onerror(err);
+            };
+            if (typeof this.callback !== 'function') {
+                onerror(new Error('`callback` is not defined'));
+                return;
+            }
+            if (!this.promisifiedCallback) {
+                if (this.callback.length >= 3) {
+                    debug('Converting legacy callback function to promise');
+                    this.promisifiedCallback = promisify_1.default(this.callback);
+                }
+                else {
+                    this.promisifiedCallback = this.callback;
+                }
+            }
+            if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+                timeoutId = setTimeout(ontimeout, timeoutMs);
+            }
+            if ('port' in opts && typeof opts.port !== 'number') {
+                opts.port = Number(opts.port);
+            }
+            try {
+                debug('Resolving socket for %o request: %o', opts.protocol, `${req.method} ${req.path}`);
+                Promise.resolve(this.promisifiedCallback(req, opts)).then(onsocket, callbackError);
+            }
+            catch (err) {
+                Promise.reject(err).catch(callbackError);
+            }
+        }
+        freeSocket(socket, opts) {
+            debug('Freeing socket %o %o', socket.constructor.name, opts);
+            socket.destroy();
+        }
+        destroy() {
+            debug('Destroying agent %o', this.constructor.name);
+        }
+    }
+    createAgent.Agent = Agent;
+    // So that `instanceof` works correctly
+    createAgent.prototype = createAgent.Agent.prototype;
+})(createAgent || (createAgent = {}));
+module.exports = createAgent;
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 8067:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+function promisify(fn) {
+    return function (req, opts) {
+        return new Promise((resolve, reject) => {
+            fn.call(this, req, opts, (err, rtn) => {
+                if (err) {
+                    reject(err);
+                }
+                else {
+                    resolve(rtn);
+                }
+            });
+        });
+    };
+}
+exports["default"] = promisify;
+//# sourceMappingURL=promisify.js.map
+
+/***/ }),
+
 /***/ 1324:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -7819,6 +8054,284 @@ var bind = __nccwpck_require__(7564);
 /** @type {import('.')} */
 module.exports = bind.call(call, $hasOwn);
 
+
+/***/ }),
+
+/***/ 6904:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const net_1 = __importDefault(__nccwpck_require__(9278));
+const tls_1 = __importDefault(__nccwpck_require__(4756));
+const url_1 = __importDefault(__nccwpck_require__(7016));
+const assert_1 = __importDefault(__nccwpck_require__(2613));
+const debug_1 = __importDefault(__nccwpck_require__(2830));
+const agent_base_1 = __nccwpck_require__(8207);
+const parse_proxy_response_1 = __importDefault(__nccwpck_require__(7943));
+const debug = debug_1.default('https-proxy-agent:agent');
+/**
+ * The `HttpsProxyAgent` implements an HTTP Agent subclass that connects to
+ * the specified "HTTP(s) proxy server" in order to proxy HTTPS requests.
+ *
+ * Outgoing HTTP requests are first tunneled through the proxy server using the
+ * `CONNECT` HTTP request method to establish a connection to the proxy server,
+ * and then the proxy server connects to the destination target and issues the
+ * HTTP request from the proxy server.
+ *
+ * `https:` requests have their socket connection upgraded to TLS once
+ * the connection to the proxy server has been established.
+ *
+ * @api public
+ */
+class HttpsProxyAgent extends agent_base_1.Agent {
+    constructor(_opts) {
+        let opts;
+        if (typeof _opts === 'string') {
+            opts = url_1.default.parse(_opts);
+        }
+        else {
+            opts = _opts;
+        }
+        if (!opts) {
+            throw new Error('an HTTP(S) proxy server `host` and `port` must be specified!');
+        }
+        debug('creating new HttpsProxyAgent instance: %o', opts);
+        super(opts);
+        const proxy = Object.assign({}, opts);
+        // If `true`, then connect to the proxy server over TLS.
+        // Defaults to `false`.
+        this.secureProxy = opts.secureProxy || isHTTPS(proxy.protocol);
+        // Prefer `hostname` over `host`, and set the `port` if needed.
+        proxy.host = proxy.hostname || proxy.host;
+        if (typeof proxy.port === 'string') {
+            proxy.port = parseInt(proxy.port, 10);
+        }
+        if (!proxy.port && proxy.host) {
+            proxy.port = this.secureProxy ? 443 : 80;
+        }
+        // ALPN is supported by Node.js >= v5.
+        // attempt to negotiate http/1.1 for proxy servers that support http/2
+        if (this.secureProxy && !('ALPNProtocols' in proxy)) {
+            proxy.ALPNProtocols = ['http 1.1'];
+        }
+        if (proxy.host && proxy.path) {
+            // If both a `host` and `path` are specified then it's most likely
+            // the result of a `url.parse()` call... we need to remove the
+            // `path` portion so that `net.connect()` doesn't attempt to open
+            // that as a Unix socket file.
+            delete proxy.path;
+            delete proxy.pathname;
+        }
+        this.proxy = proxy;
+    }
+    /**
+     * Called when the node-core HTTP client library is creating a
+     * new HTTP request.
+     *
+     * @api protected
+     */
+    callback(req, opts) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const { proxy, secureProxy } = this;
+            // Create a socket connection to the proxy server.
+            let socket;
+            if (secureProxy) {
+                debug('Creating `tls.Socket`: %o', proxy);
+                socket = tls_1.default.connect(proxy);
+            }
+            else {
+                debug('Creating `net.Socket`: %o', proxy);
+                socket = net_1.default.connect(proxy);
+            }
+            const headers = Object.assign({}, proxy.headers);
+            const hostname = `${opts.host}:${opts.port}`;
+            let payload = `CONNECT ${hostname} HTTP/1.1\r\n`;
+            // Inject the `Proxy-Authorization` header if necessary.
+            if (proxy.auth) {
+                headers['Proxy-Authorization'] = `Basic ${Buffer.from(proxy.auth).toString('base64')}`;
+            }
+            // The `Host` header should only include the port
+            // number when it is not the default port.
+            let { host, port, secureEndpoint } = opts;
+            if (!isDefaultPort(port, secureEndpoint)) {
+                host += `:${port}`;
+            }
+            headers.Host = host;
+            headers.Connection = 'close';
+            for (const name of Object.keys(headers)) {
+                payload += `${name}: ${headers[name]}\r\n`;
+            }
+            const proxyResponsePromise = parse_proxy_response_1.default(socket);
+            socket.write(`${payload}\r\n`);
+            const { statusCode, buffered } = yield proxyResponsePromise;
+            if (statusCode === 200) {
+                req.once('socket', resume);
+                if (opts.secureEndpoint) {
+                    // The proxy is connecting to a TLS server, so upgrade
+                    // this socket connection to a TLS connection.
+                    debug('Upgrading socket connection to TLS');
+                    const servername = opts.servername || opts.host;
+                    return tls_1.default.connect(Object.assign(Object.assign({}, omit(opts, 'host', 'hostname', 'path', 'port')), { socket,
+                        servername }));
+                }
+                return socket;
+            }
+            // Some other status code that's not 200... need to re-play the HTTP
+            // header "data" events onto the socket once the HTTP machinery is
+            // attached so that the node core `http` can parse and handle the
+            // error status code.
+            // Close the original socket, and a new "fake" socket is returned
+            // instead, so that the proxy doesn't get the HTTP request
+            // written to it (which may contain `Authorization` headers or other
+            // sensitive data).
+            //
+            // See: https://hackerone.com/reports/541502
+            socket.destroy();
+            const fakeSocket = new net_1.default.Socket({ writable: false });
+            fakeSocket.readable = true;
+            // Need to wait for the "socket" event to re-play the "data" events.
+            req.once('socket', (s) => {
+                debug('replaying proxy buffer for failed request');
+                assert_1.default(s.listenerCount('data') > 0);
+                // Replay the "buffered" Buffer onto the fake `socket`, since at
+                // this point the HTTP module machinery has been hooked up for
+                // the user.
+                s.push(buffered);
+                s.push(null);
+            });
+            return fakeSocket;
+        });
+    }
+}
+exports["default"] = HttpsProxyAgent;
+function resume(socket) {
+    socket.resume();
+}
+function isDefaultPort(port, secure) {
+    return Boolean((!secure && port === 80) || (secure && port === 443));
+}
+function isHTTPS(protocol) {
+    return typeof protocol === 'string' ? /^https:?$/i.test(protocol) : false;
+}
+function omit(obj, ...keys) {
+    const ret = {};
+    let key;
+    for (key in obj) {
+        if (!keys.includes(key)) {
+            ret[key] = obj[key];
+        }
+    }
+    return ret;
+}
+//# sourceMappingURL=agent.js.map
+
+/***/ }),
+
+/***/ 3669:
+/***/ (function(module, __unused_webpack_exports, __nccwpck_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+const agent_1 = __importDefault(__nccwpck_require__(6904));
+function createHttpsProxyAgent(opts) {
+    return new agent_1.default(opts);
+}
+(function (createHttpsProxyAgent) {
+    createHttpsProxyAgent.HttpsProxyAgent = agent_1.default;
+    createHttpsProxyAgent.prototype = agent_1.default.prototype;
+})(createHttpsProxyAgent || (createHttpsProxyAgent = {}));
+module.exports = createHttpsProxyAgent;
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 7943:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const debug_1 = __importDefault(__nccwpck_require__(2830));
+const debug = debug_1.default('https-proxy-agent:parse-proxy-response');
+function parseProxyResponse(socket) {
+    return new Promise((resolve, reject) => {
+        // we need to buffer any HTTP traffic that happens with the proxy before we get
+        // the CONNECT response, so that if the response is anything other than an "200"
+        // response code, then we can re-play the "data" events on the socket once the
+        // HTTP parser is hooked up...
+        let buffersLength = 0;
+        const buffers = [];
+        function read() {
+            const b = socket.read();
+            if (b)
+                ondata(b);
+            else
+                socket.once('readable', read);
+        }
+        function cleanup() {
+            socket.removeListener('end', onend);
+            socket.removeListener('error', onerror);
+            socket.removeListener('close', onclose);
+            socket.removeListener('readable', read);
+        }
+        function onclose(err) {
+            debug('onclose had error %o', err);
+        }
+        function onend() {
+            debug('onend');
+        }
+        function onerror(err) {
+            cleanup();
+            debug('onerror %o', err);
+            reject(err);
+        }
+        function ondata(b) {
+            buffers.push(b);
+            buffersLength += b.length;
+            const buffered = Buffer.concat(buffers, buffersLength);
+            const endOfHeaders = buffered.indexOf('\r\n\r\n');
+            if (endOfHeaders === -1) {
+                // keep buffering
+                debug('have not received end of HTTP headers yet...');
+                read();
+                return;
+            }
+            const firstLine = buffered.toString('ascii', 0, buffered.indexOf('\r\n'));
+            const statusCode = +firstLine.split(' ')[1];
+            debug('got proxy server response: %o', firstLine);
+            resolve({
+                statusCode,
+                buffered
+            });
+        }
+        socket.on('error', onerror);
+        socket.on('close', onclose);
+        socket.on('end', onend);
+        read();
+    });
+}
+exports["default"] = parseProxyResponse;
+//# sourceMappingURL=parse-proxy-response.js.map
 
 /***/ }),
 
@@ -38652,6 +39165,342 @@ module.exports = parseParams
 
 /***/ }),
 
+/***/ 6587:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.EXPANSION_MAX_LENGTH = exports.EXPANSION_MAX = void 0;
+exports.expand = expand;
+const balanced_match_1 = __nccwpck_require__(3580);
+const escSlash = '\0SLASH' + Math.random() + '\0';
+const escOpen = '\0OPEN' + Math.random() + '\0';
+const escClose = '\0CLOSE' + Math.random() + '\0';
+const escComma = '\0COMMA' + Math.random() + '\0';
+const escPeriod = '\0PERIOD' + Math.random() + '\0';
+const escSlashPattern = new RegExp(escSlash, 'g');
+const escOpenPattern = new RegExp(escOpen, 'g');
+const escClosePattern = new RegExp(escClose, 'g');
+const escCommaPattern = new RegExp(escComma, 'g');
+const escPeriodPattern = new RegExp(escPeriod, 'g');
+const slashPattern = /\\\\/g;
+const openPattern = /\\{/g;
+const closePattern = /\\}/g;
+const commaPattern = /\\,/g;
+const periodPattern = /\\\./g;
+exports.EXPANSION_MAX = 100_000;
+// `EXPANSION_MAX` caps the *number* of expansions, but not their length. An
+// input like `'{a,b}'.repeat(1500)` stays under that count - its output is
+// truncated to 100k results - while making every result ~1500 characters
+// long. The result set, and the intermediate arrays built while combining
+// brace sets, then grow large enough to exhaust memory and crash the process
+// (CVE-2026-14257). `EXPANSION_MAX_LENGTH` bounds the total number of
+// characters the accumulator may hold at any point, so memory stays flat no
+// matter how many brace groups are chained. The limit sits well above any
+// realistic expansion (100k results hitting `EXPANSION_MAX` measure ~1M
+// characters) so legitimate input is unaffected.
+exports.EXPANSION_MAX_LENGTH = 4_000_000;
+function numeric(str) {
+    return !isNaN(str) ? parseInt(str, 10) : str.charCodeAt(0);
+}
+function escapeBraces(str) {
+    return str
+        .replace(slashPattern, escSlash)
+        .replace(openPattern, escOpen)
+        .replace(closePattern, escClose)
+        .replace(commaPattern, escComma)
+        .replace(periodPattern, escPeriod);
+}
+function unescapeBraces(str) {
+    return str
+        .replace(escSlashPattern, '\\')
+        .replace(escOpenPattern, '{')
+        .replace(escClosePattern, '}')
+        .replace(escCommaPattern, ',')
+        .replace(escPeriodPattern, '.');
+}
+/**
+ * Basically just str.split(","), but handling cases
+ * where we have nested braced sections, which should be
+ * treated as individual members, like {a,{b,c},d}
+ */
+function parseCommaParts(str) {
+    if (!str) {
+        return [''];
+    }
+    const parts = [];
+    const m = (0, balanced_match_1.balanced)('{', '}', str);
+    if (!m) {
+        return str.split(',');
+    }
+    const { pre, body, post } = m;
+    const p = pre.split(',');
+    p[p.length - 1] += '{' + body + '}';
+    const postParts = parseCommaParts(post);
+    if (post.length) {
+        ;
+        p[p.length - 1] += postParts.shift();
+        p.push.apply(p, postParts);
+    }
+    parts.push.apply(parts, p);
+    return parts;
+}
+function expand(str, options = {}) {
+    if (!str) {
+        return [];
+    }
+    const { max = exports.EXPANSION_MAX, maxLength = exports.EXPANSION_MAX_LENGTH } = options;
+    // I don't know why Bash 4.3 does this, but it does.
+    // Anything starting with {} will have the first two bytes preserved
+    // but *only* at the top level, so {},a}b will not expand to anything,
+    // but a{},b}c will be expanded to [a}c,abc].
+    // One could argue that this is a bug in Bash, but since the goal of
+    // this module is to match Bash's rules, we escape a leading {}
+    if (str.slice(0, 2) === '{}') {
+        str = '\\{\\}' + str.slice(2);
+    }
+    return expand_(escapeBraces(str), max, maxLength, true).map(unescapeBraces);
+}
+function embrace(str) {
+    return '{' + str + '}';
+}
+function isPadded(el) {
+    return /^-?0\d/.test(el);
+}
+function lte(i, y) {
+    return i <= y;
+}
+function gte(i, y) {
+    return i >= y;
+}
+// Build `{ acc[a] + pre + values[v] }` for every combination, capping the
+// number of results at `max` and the total number of characters at `maxLength`.
+// This is the one place output grows, so bounding it here keeps the single
+// accumulator - and therefore memory - flat regardless of how many brace groups
+// are combined (CVE-2026-14257).
+function combine(acc, pre, values, max, maxLength, dropEmpties) {
+    const out = [];
+    let length = 0;
+    for (let a = 0; a < acc.length; a++) {
+        for (let v = 0; v < values.length; v++) {
+            if (out.length >= max)
+                return out;
+            const expansion = acc[a] + pre + values[v];
+            // Bash drops empty results at the top level. Skip them before they count
+            // against `max`, so `max` bounds the number of *kept* results.
+            if (dropEmpties && !expansion)
+                continue;
+            if (length + expansion.length > maxLength)
+                return out;
+            out.push(expansion);
+            length += expansion.length;
+        }
+    }
+    return out;
+}
+// The expansion values of a single numeric (`1..5`) or alphabetic (`a..e..2`)
+// sequence body.
+function expandSequence(body, isAlphaSequence, max) {
+    const n = body.split(/\.\./);
+    const N = [];
+    // A sequence body always splits into two or three parts, but the compiler
+    // can't know that.
+    /* c8 ignore start */
+    if (n[0] === undefined || n[1] === undefined) {
+        return N;
+    }
+    /* c8 ignore stop */
+    const x = numeric(n[0]);
+    const y = numeric(n[1]);
+    const width = Math.max(n[0].length, n[1].length);
+    let incr = n.length === 3 && n[2] !== undefined ?
+        Math.max(Math.abs(numeric(n[2])), 1)
+        : 1;
+    let test = lte;
+    const reverse = y < x;
+    if (reverse) {
+        incr *= -1;
+        test = gte;
+    }
+    const pad = n.some(isPadded);
+    for (let i = x; test(i, y) && N.length < max; i += incr) {
+        let c;
+        if (isAlphaSequence) {
+            c = String.fromCharCode(i);
+            if (c === '\\') {
+                c = '';
+            }
+        }
+        else {
+            c = String(i);
+            if (pad) {
+                const need = width - c.length;
+                if (need > 0) {
+                    const z = new Array(need + 1).join('0');
+                    if (i < 0) {
+                        c = '-' + z + c.slice(1);
+                    }
+                    else {
+                        c = z + c;
+                    }
+                }
+            }
+        }
+        N.push(c);
+    }
+    return N;
+}
+function expand_(str, max, maxLength, isTop) {
+    // Consume the string's top-level brace groups left to right, threading a
+    // running set of combined prefixes (`acc`). Expanding the tail iteratively -
+    // rather than recursing on `m.post` once per group - keeps the native stack
+    // depth constant, so deeply chained input (`'{a,b}'.repeat(3000)`) can no
+    // longer overflow the stack, and leaves a single accumulator whose size
+    // `maxLength` bounds directly (CVE-2026-14257).
+    let acc = [''];
+    // Bash drops empty results, but only when the *first* top-level group is a
+    // comma set - a sequence like `{a..\}` may legitimately yield ''. The drop
+    // is on the final strings, so it is applied to whichever `combine` produces
+    // them (the one with no brace set left in the tail).
+    let dropEmpties = false;
+    let firstGroup = true;
+    for (;;) {
+        const m = (0, balanced_match_1.balanced)('{', '}', str);
+        // No brace set left: the rest of the string is literal.
+        if (!m) {
+            return combine(acc, str, [''], max, maxLength, dropEmpties);
+        }
+        // no need to expand pre, since it is guaranteed to be free of brace-sets
+        const pre = m.pre;
+        if (/\$$/.test(pre)) {
+            acc = combine(acc, pre + '{' + m.body + '}', [''], max, maxLength, dropEmpties && !m.post.length);
+            firstGroup = false;
+            if (!m.post.length)
+                break;
+            str = m.post;
+            continue;
+        }
+        const isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
+        const isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
+        const isSequence = isNumericSequence || isAlphaSequence;
+        const isOptions = m.body.indexOf(',') >= 0;
+        if (!isSequence && !isOptions) {
+            // {a},b}
+            if (m.post.match(/,(?!,).*\}/)) {
+                str = m.pre + '{' + m.body + escClose + m.post;
+                isTop = true;
+                continue;
+            }
+            // Nothing here expands, so the whole remaining string is literal.
+            return combine(acc, pre + '{' + m.body + '}' + m.post, [''], max, maxLength, dropEmpties);
+        }
+        if (firstGroup) {
+            dropEmpties = isTop && !isSequence;
+            firstGroup = false;
+        }
+        let values;
+        if (isSequence) {
+            values = expandSequence(m.body, isAlphaSequence, max);
+        }
+        else {
+            let n = parseCommaParts(m.body);
+            if (n.length === 1 && n[0] !== undefined) {
+                // x{{a,b}}y ==> x{a}y x{b}y
+                n = expand_(n[0], max, maxLength, false).map(embrace);
+                //XXX is this necessary? Can't seem to hit it in tests.
+                /* c8 ignore start */
+                if (n.length === 1) {
+                    acc = combine(acc, pre + n[0], [''], max, maxLength, dropEmpties && !m.post.length);
+                    if (!m.post.length)
+                        break;
+                    str = m.post;
+                    continue;
+                }
+                /* c8 ignore stop */
+            }
+            values = [];
+            for (let j = 0; j < n.length; j++) {
+                values.push.apply(values, expand_(n[j], max, maxLength, false));
+            }
+        }
+        acc = combine(acc, pre, values, max, maxLength, dropEmpties && !m.post.length);
+        if (!m.post.length)
+            break;
+        str = m.post;
+    }
+    return acc;
+}
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 3580:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.range = exports.balanced = void 0;
+const balanced = (a, b, str) => {
+    const ma = a instanceof RegExp ? maybeMatch(a, str) : a;
+    const mb = b instanceof RegExp ? maybeMatch(b, str) : b;
+    const r = ma !== null && mb != null && (0, exports.range)(ma, mb, str);
+    return (r && {
+        start: r[0],
+        end: r[1],
+        pre: str.slice(0, r[0]),
+        body: str.slice(r[0] + ma.length, r[1]),
+        post: str.slice(r[1] + mb.length),
+    });
+};
+exports.balanced = balanced;
+const maybeMatch = (reg, str) => {
+    const m = str.match(reg);
+    return m ? m[0] : null;
+};
+const range = (a, b, str) => {
+    let begs, beg, left, right = undefined, result;
+    let ai = str.indexOf(a);
+    let bi = str.indexOf(b, ai + 1);
+    let i = ai;
+    if (ai >= 0 && bi > 0) {
+        if (a === b) {
+            return [ai, bi];
+        }
+        begs = [];
+        left = str.length;
+        while (i >= 0 && !result) {
+            if (i === ai) {
+                begs.push(i);
+                ai = str.indexOf(a, i + 1);
+            }
+            else if (begs.length === 1) {
+                const r = begs.pop();
+                if (r !== undefined)
+                    result = [r, bi];
+            }
+            else {
+                beg = begs.pop();
+                if (beg !== undefined && beg < left) {
+                    left = beg;
+                    right = bi;
+                }
+                bi = str.indexOf(b, i + 1);
+            }
+            i = ai < bi && ai >= 0 ? ai : bi;
+        }
+        if (begs.length && right !== undefined) {
+            result = [left, right];
+        }
+    }
+    return result;
+};
+exports.range = range;
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
 /***/ 7305:
 /***/ ((__unused_webpack_module, exports) => {
 
@@ -39727,7 +40576,7 @@ exports.escape = escape;
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.unescape = exports.escape = exports.AST = exports.Minimatch = exports.match = exports.makeRe = exports.braceExpand = exports.defaults = exports.filter = exports.GLOBSTAR = exports.sep = exports.minimatch = void 0;
-const brace_expansion_1 = __nccwpck_require__(5034);
+const brace_expansion_1 = __nccwpck_require__(6587);
 const assert_valid_pattern_js_1 = __nccwpck_require__(7305);
 const ast_js_1 = __nccwpck_require__(1803);
 const escape_js_1 = __nccwpck_require__(800);
@@ -40893,287 +41742,13 @@ exports.unescape = unescape;
 
 /***/ }),
 
-/***/ 2867:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.range = exports.balanced = void 0;
-const balanced = (a, b, str) => {
-    const ma = a instanceof RegExp ? maybeMatch(a, str) : a;
-    const mb = b instanceof RegExp ? maybeMatch(b, str) : b;
-    const r = ma !== null && mb != null && (0, exports.range)(ma, mb, str);
-    return (r && {
-        start: r[0],
-        end: r[1],
-        pre: str.slice(0, r[0]),
-        body: str.slice(r[0] + ma.length, r[1]),
-        post: str.slice(r[1] + mb.length),
-    });
-};
-exports.balanced = balanced;
-const maybeMatch = (reg, str) => {
-    const m = str.match(reg);
-    return m ? m[0] : null;
-};
-const range = (a, b, str) => {
-    let begs, beg, left, right = undefined, result;
-    let ai = str.indexOf(a);
-    let bi = str.indexOf(b, ai + 1);
-    let i = ai;
-    if (ai >= 0 && bi > 0) {
-        if (a === b) {
-            return [ai, bi];
-        }
-        begs = [];
-        left = str.length;
-        while (i >= 0 && !result) {
-            if (i === ai) {
-                begs.push(i);
-                ai = str.indexOf(a, i + 1);
-            }
-            else if (begs.length === 1) {
-                const r = begs.pop();
-                if (r !== undefined)
-                    result = [r, bi];
-            }
-            else {
-                beg = begs.pop();
-                if (beg !== undefined && beg < left) {
-                    left = beg;
-                    right = bi;
-                }
-                bi = str.indexOf(b, i + 1);
-            }
-            i = ai < bi && ai >= 0 ? ai : bi;
-        }
-        if (begs.length && right !== undefined) {
-            result = [left, right];
-        }
-    }
-    return result;
-};
-exports.range = range;
-//# sourceMappingURL=index.js.map
-
-/***/ }),
-
-/***/ 5034:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.EXPANSION_MAX = void 0;
-exports.expand = expand;
-const balanced_match_1 = __nccwpck_require__(2867);
-const escSlash = '\0SLASH' + Math.random() + '\0';
-const escOpen = '\0OPEN' + Math.random() + '\0';
-const escClose = '\0CLOSE' + Math.random() + '\0';
-const escComma = '\0COMMA' + Math.random() + '\0';
-const escPeriod = '\0PERIOD' + Math.random() + '\0';
-const escSlashPattern = new RegExp(escSlash, 'g');
-const escOpenPattern = new RegExp(escOpen, 'g');
-const escClosePattern = new RegExp(escClose, 'g');
-const escCommaPattern = new RegExp(escComma, 'g');
-const escPeriodPattern = new RegExp(escPeriod, 'g');
-const slashPattern = /\\\\/g;
-const openPattern = /\\{/g;
-const closePattern = /\\}/g;
-const commaPattern = /\\,/g;
-const periodPattern = /\\\./g;
-exports.EXPANSION_MAX = 100_000;
-function numeric(str) {
-    return !isNaN(str) ? parseInt(str, 10) : str.charCodeAt(0);
-}
-function escapeBraces(str) {
-    return str
-        .replace(slashPattern, escSlash)
-        .replace(openPattern, escOpen)
-        .replace(closePattern, escClose)
-        .replace(commaPattern, escComma)
-        .replace(periodPattern, escPeriod);
-}
-function unescapeBraces(str) {
-    return str
-        .replace(escSlashPattern, '\\')
-        .replace(escOpenPattern, '{')
-        .replace(escClosePattern, '}')
-        .replace(escCommaPattern, ',')
-        .replace(escPeriodPattern, '.');
-}
-/**
- * Basically just str.split(","), but handling cases
- * where we have nested braced sections, which should be
- * treated as individual members, like {a,{b,c},d}
- */
-function parseCommaParts(str) {
-    if (!str) {
-        return [''];
-    }
-    const parts = [];
-    const m = (0, balanced_match_1.balanced)('{', '}', str);
-    if (!m) {
-        return str.split(',');
-    }
-    const { pre, body, post } = m;
-    const p = pre.split(',');
-    p[p.length - 1] += '{' + body + '}';
-    const postParts = parseCommaParts(post);
-    if (post.length) {
-        ;
-        p[p.length - 1] += postParts.shift();
-        p.push.apply(p, postParts);
-    }
-    parts.push.apply(parts, p);
-    return parts;
-}
-function expand(str, options = {}) {
-    if (!str) {
-        return [];
-    }
-    const { max = exports.EXPANSION_MAX } = options;
-    // I don't know why Bash 4.3 does this, but it does.
-    // Anything starting with {} will have the first two bytes preserved
-    // but *only* at the top level, so {},a}b will not expand to anything,
-    // but a{},b}c will be expanded to [a}c,abc].
-    // One could argue that this is a bug in Bash, but since the goal of
-    // this module is to match Bash's rules, we escape a leading {}
-    if (str.slice(0, 2) === '{}') {
-        str = '\\{\\}' + str.slice(2);
-    }
-    return expand_(escapeBraces(str), max, true).map(unescapeBraces);
-}
-function embrace(str) {
-    return '{' + str + '}';
-}
-function isPadded(el) {
-    return /^-?0\d/.test(el);
-}
-function lte(i, y) {
-    return i <= y;
-}
-function gte(i, y) {
-    return i >= y;
-}
-function expand_(str, max, isTop) {
-    /** @type {string[]} */
-    const expansions = [];
-    const m = (0, balanced_match_1.balanced)('{', '}', str);
-    if (!m)
-        return [str];
-    // no need to expand pre, since it is guaranteed to be free of brace-sets
-    const pre = m.pre;
-    const post = m.post.length ? expand_(m.post, max, false) : [''];
-    if (/\$$/.test(m.pre)) {
-        for (let k = 0; k < post.length && k < max; k++) {
-            const expansion = pre + '{' + m.body + '}' + post[k];
-            expansions.push(expansion);
-        }
-    }
-    else {
-        const isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
-        const isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
-        const isSequence = isNumericSequence || isAlphaSequence;
-        const isOptions = m.body.indexOf(',') >= 0;
-        if (!isSequence && !isOptions) {
-            // {a},b}
-            if (m.post.match(/,(?!,).*\}/)) {
-                str = m.pre + '{' + m.body + escClose + m.post;
-                return expand_(str, max, true);
-            }
-            return [str];
-        }
-        let n;
-        if (isSequence) {
-            n = m.body.split(/\.\./);
-        }
-        else {
-            n = parseCommaParts(m.body);
-            if (n.length === 1 && n[0] !== undefined) {
-                // x{{a,b}}y ==> x{a}y x{b}y
-                n = expand_(n[0], max, false).map(embrace);
-                //XXX is this necessary? Can't seem to hit it in tests.
-                /* c8 ignore start */
-                if (n.length === 1) {
-                    return post.map(p => m.pre + n[0] + p);
-                }
-                /* c8 ignore stop */
-            }
-        }
-        // at this point, n is the parts, and we know it's not a comma set
-        // with a single entry.
-        let N;
-        if (isSequence && n[0] !== undefined && n[1] !== undefined) {
-            const x = numeric(n[0]);
-            const y = numeric(n[1]);
-            const width = Math.max(n[0].length, n[1].length);
-            let incr = n.length === 3 && n[2] !== undefined ?
-                Math.max(Math.abs(numeric(n[2])), 1)
-                : 1;
-            let test = lte;
-            const reverse = y < x;
-            if (reverse) {
-                incr *= -1;
-                test = gte;
-            }
-            const pad = n.some(isPadded);
-            N = [];
-            for (let i = x; test(i, y) && N.length < max; i += incr) {
-                let c;
-                if (isAlphaSequence) {
-                    c = String.fromCharCode(i);
-                    if (c === '\\') {
-                        c = '';
-                    }
-                }
-                else {
-                    c = String(i);
-                    if (pad) {
-                        const need = width - c.length;
-                        if (need > 0) {
-                            const z = new Array(need + 1).join('0');
-                            if (i < 0) {
-                                c = '-' + z + c.slice(1);
-                            }
-                            else {
-                                c = z + c;
-                            }
-                        }
-                    }
-                }
-                N.push(c);
-            }
-        }
-        else {
-            N = [];
-            for (let j = 0; j < n.length; j++) {
-                N.push.apply(N, expand_(n[j], max, false));
-            }
-        }
-        for (let j = 0; j < N.length; j++) {
-            for (let k = 0; k < post.length && expansions.length < max; k++) {
-                const expansion = pre + N[j] + post[k];
-                if (!isTop || isSequence || expansion) {
-                    expansions.push(expansion);
-                }
-            }
-        }
-    }
-    return expansions;
-}
-//# sourceMappingURL=index.js.map
-
-/***/ }),
-
 /***/ 5942:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
-var d=(s,e)=>()=>(e||s((e={exports:{}}).exports,e),e.exports);var We=d(F=>{"use strict";var Ro=F&&F.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(F,"__esModule",{value:!0});F.Minipass=F.isWritable=F.isReadable=F.isStream=void 0;var Br=typeof process=="object"&&process?process:{stdout:null,stderr:null},is=__nccwpck_require__(8474),jr=Ro(__nccwpck_require__(7075)),vo=__nccwpck_require__(6193),To=s=>!!s&&typeof s=="object"&&(s instanceof Zt||s instanceof jr.default||(0,F.isReadable)(s)||(0,F.isWritable)(s));F.isStream=To;var Do=s=>!!s&&typeof s=="object"&&s instanceof is.EventEmitter&&typeof s.pipe=="function"&&s.pipe!==jr.default.Writable.prototype.pipe;F.isReadable=Do;var Po=s=>!!s&&typeof s=="object"&&s instanceof is.EventEmitter&&typeof s.write=="function"&&typeof s.end=="function";F.isWritable=Po;var le=Symbol("EOF"),ue=Symbol("maybeEmitEnd"),_e=Symbol("emittedEnd"),xt=Symbol("emittingEnd"),dt=Symbol("emittedError"),jt=Symbol("closed"),zr=Symbol("read"),Ut=Symbol("flush"),kr=Symbol("flushChunk"),K=Symbol("encoding"),Ue=Symbol("decoder"),O=Symbol("flowing"),mt=Symbol("paused"),qe=Symbol("resume"),R=Symbol("buffer"),I=Symbol("pipes"),v=Symbol("bufferLength"),$i=Symbol("bufferPush"),qt=Symbol("bufferShift"),N=Symbol("objectMode"),y=Symbol("destroyed"),Xi=Symbol("error"),Qi=Symbol("emitData"),xr=Symbol("emitEnd"),Ji=Symbol("emitEnd2"),J=Symbol("async"),es=Symbol("abort"),Wt=Symbol("aborted"),pt=Symbol("signal"),Ne=Symbol("dataListeners"),x=Symbol("discarded"),_t=s=>Promise.resolve().then(s),No=s=>s(),Mo=s=>s==="end"||s==="finish"||s==="prefinish",Lo=s=>s instanceof ArrayBuffer||!!s&&typeof s=="object"&&s.constructor&&s.constructor.name==="ArrayBuffer"&&s.byteLength>=0,Ao=s=>!Buffer.isBuffer(s)&&ArrayBuffer.isView(s),Ht=class{src;dest;opts;ondrain;constructor(e,t,i){this.src=e,this.dest=t,this.opts=i,this.ondrain=()=>e[qe](),this.dest.on("drain",this.ondrain)}unpipe(){this.dest.removeListener("drain",this.ondrain)}proxyErrors(e){}end(){this.unpipe(),this.opts.end&&this.dest.end()}},ts=class extends Ht{unpipe(){this.src.removeListener("error",this.proxyErrors),super.unpipe()}constructor(e,t,i){super(e,t,i),this.proxyErrors=r=>this.dest.emit("error",r),e.on("error",this.proxyErrors)}},Io=s=>!!s.objectMode,Fo=s=>!s.objectMode&&!!s.encoding&&s.encoding!=="buffer",Zt=class extends is.EventEmitter{[O]=!1;[mt]=!1;[I]=[];[R]=[];[N];[K];[J];[Ue];[le]=!1;[_e]=!1;[xt]=!1;[jt]=!1;[dt]=null;[v]=0;[y]=!1;[pt];[Wt]=!1;[Ne]=0;[x]=!1;writable=!0;readable=!0;constructor(...e){let t=e[0]||{};if(super(),t.objectMode&&typeof t.encoding=="string")throw new TypeError("Encoding and objectMode may not be used together");Io(t)?(this[N]=!0,this[K]=null):Fo(t)?(this[K]=t.encoding,this[N]=!1):(this[N]=!1,this[K]=null),this[J]=!!t.async,this[Ue]=this[K]?new vo.StringDecoder(this[K]):null,t&&t.debugExposeBuffer===!0&&Object.defineProperty(this,"buffer",{get:()=>this[R]}),t&&t.debugExposePipes===!0&&Object.defineProperty(this,"pipes",{get:()=>this[I]});let{signal:i}=t;i&&(this[pt]=i,i.aborted?this[es]():i.addEventListener("abort",()=>this[es]()))}get bufferLength(){return this[v]}get encoding(){return this[K]}set encoding(e){throw new Error("Encoding must be set at instantiation time")}setEncoding(e){throw new Error("Encoding must be set at instantiation time")}get objectMode(){return this[N]}set objectMode(e){throw new Error("objectMode must be set at instantiation time")}get async(){return this[J]}set async(e){this[J]=this[J]||!!e}[es](){this[Wt]=!0,this.emit("abort",this[pt]?.reason),this.destroy(this[pt]?.reason)}get aborted(){return this[Wt]}set aborted(e){}write(e,t,i){if(this[Wt])return!1;if(this[le])throw new Error("write after end");if(this[y])return this.emit("error",Object.assign(new Error("Cannot call write after a stream was destroyed"),{code:"ERR_STREAM_DESTROYED"})),!0;typeof t=="function"&&(i=t,t="utf8"),t||(t="utf8");let r=this[J]?_t:No;if(!this[N]&&!Buffer.isBuffer(e)){if(Ao(e))e=Buffer.from(e.buffer,e.byteOffset,e.byteLength);else if(Lo(e))e=Buffer.from(e);else if(typeof e!="string")throw new Error("Non-contiguous data written to non-objectMode stream")}return this[N]?(this[O]&&this[v]!==0&&this[Ut](!0),this[O]?this.emit("data",e):this[$i](e),this[v]!==0&&this.emit("readable"),i&&r(i),this[O]):e.length?(typeof e=="string"&&!(t===this[K]&&!this[Ue]?.lastNeed)&&(e=Buffer.from(e,t)),Buffer.isBuffer(e)&&this[K]&&(e=this[Ue].write(e)),this[O]&&this[v]!==0&&this[Ut](!0),this[O]?this.emit("data",e):this[$i](e),this[v]!==0&&this.emit("readable"),i&&r(i),this[O]):(this[v]!==0&&this.emit("readable"),i&&r(i),this[O])}read(e){if(this[y])return null;if(this[x]=!1,this[v]===0||e===0||e&&e>this[v])return this[ue](),null;this[N]&&(e=null),this[R].length>1&&!this[N]&&(this[R]=[this[K]?this[R].join(""):Buffer.concat(this[R],this[v])]);let t=this[zr](e||null,this[R][0]);return this[ue](),t}[zr](e,t){if(this[N])this[qt]();else{let i=t;e===i.length||e===null?this[qt]():typeof i=="string"?(this[R][0]=i.slice(e),t=i.slice(0,e),this[v]-=e):(this[R][0]=i.subarray(e),t=i.subarray(0,e),this[v]-=e)}return this.emit("data",t),!this[R].length&&!this[le]&&this.emit("drain"),t}end(e,t,i){return typeof e=="function"&&(i=e,e=void 0),typeof t=="function"&&(i=t,t="utf8"),e!==void 0&&this.write(e,t),i&&this.once("end",i),this[le]=!0,this.writable=!1,(this[O]||!this[mt])&&this[ue](),this}[qe](){this[y]||(!this[Ne]&&!this[I].length&&(this[x]=!0),this[mt]=!1,this[O]=!0,this.emit("resume"),this[R].length?this[Ut]():this[le]?this[ue]():this.emit("drain"))}resume(){return this[qe]()}pause(){this[O]=!1,this[mt]=!0,this[x]=!1}get destroyed(){return this[y]}get flowing(){return this[O]}get paused(){return this[mt]}[$i](e){this[N]?this[v]+=1:this[v]+=e.length,this[R].push(e)}[qt](){return this[N]?this[v]-=1:this[v]-=this[R][0].length,this[R].shift()}[Ut](e=!1){do;while(this[kr](this[qt]())&&this[R].length);!e&&!this[R].length&&!this[le]&&this.emit("drain")}[kr](e){return this.emit("data",e),this[O]}pipe(e,t){if(this[y])return e;this[x]=!1;let i=this[_e];return t=t||{},e===Br.stdout||e===Br.stderr?t.end=!1:t.end=t.end!==!1,t.proxyErrors=!!t.proxyErrors,i?t.end&&e.end():(this[I].push(t.proxyErrors?new ts(this,e,t):new Ht(this,e,t)),this[J]?_t(()=>this[qe]()):this[qe]()),e}unpipe(e){let t=this[I].find(i=>i.dest===e);t&&(this[I].length===1?(this[O]&&this[Ne]===0&&(this[O]=!1),this[I]=[]):this[I].splice(this[I].indexOf(t),1),t.unpipe())}addListener(e,t){return this.on(e,t)}on(e,t){let i=super.on(e,t);if(e==="data")this[x]=!1,this[Ne]++,!this[I].length&&!this[O]&&this[qe]();else if(e==="readable"&&this[v]!==0)super.emit("readable");else if(Mo(e)&&this[_e])super.emit(e),this.removeAllListeners(e);else if(e==="error"&&this[dt]){let r=t;this[J]?_t(()=>r.call(this,this[dt])):r.call(this,this[dt])}return i}removeListener(e,t){return this.off(e,t)}off(e,t){let i=super.off(e,t);return e==="data"&&(this[Ne]=this.listeners("data").length,this[Ne]===0&&!this[x]&&!this[I].length&&(this[O]=!1)),i}removeAllListeners(e){let t=super.removeAllListeners(e);return(e==="data"||e===void 0)&&(this[Ne]=0,!this[x]&&!this[I].length&&(this[O]=!1)),t}get emittedEnd(){return this[_e]}[ue](){!this[xt]&&!this[_e]&&!this[y]&&this[R].length===0&&this[le]&&(this[xt]=!0,this.emit("end"),this.emit("prefinish"),this.emit("finish"),this[jt]&&this.emit("close"),this[xt]=!1)}emit(e,...t){let i=t[0];if(e!=="error"&&e!=="close"&&e!==y&&this[y])return!1;if(e==="data")return!this[N]&&!i?!1:this[J]?(_t(()=>this[Qi](i)),!0):this[Qi](i);if(e==="end")return this[xr]();if(e==="close"){if(this[jt]=!0,!this[_e]&&!this[y])return!1;let n=super.emit("close");return this.removeAllListeners("close"),n}else if(e==="error"){this[dt]=i,super.emit(Xi,i);let n=!this[pt]||this.listeners("error").length?super.emit("error",i):!1;return this[ue](),n}else if(e==="resume"){let n=super.emit("resume");return this[ue](),n}else if(e==="finish"||e==="prefinish"){let n=super.emit(e);return this.removeAllListeners(e),n}let r=super.emit(e,...t);return this[ue](),r}[Qi](e){for(let i of this[I])i.dest.write(e)===!1&&this.pause();let t=this[x]?!1:super.emit("data",e);return this[ue](),t}[xr](){return this[_e]?!1:(this[_e]=!0,this.readable=!1,this[J]?(_t(()=>this[Ji]()),!0):this[Ji]())}[Ji](){if(this[Ue]){let t=this[Ue].end();if(t){for(let i of this[I])i.dest.write(t);this[x]||super.emit("data",t)}}for(let t of this[I])t.end();let e=super.emit("end");return this.removeAllListeners("end"),e}async collect(){let e=Object.assign([],{dataLength:0});this[N]||(e.dataLength=0);let t=this.promise();return this.on("data",i=>{e.push(i),this[N]||(e.dataLength+=i.length)}),await t,e}async concat(){if(this[N])throw new Error("cannot concat in objectMode");let e=await this.collect();return this[K]?e.join(""):Buffer.concat(e,e.dataLength)}async promise(){return new Promise((e,t)=>{this.on(y,()=>t(new Error("stream destroyed"))),this.on("error",i=>t(i)),this.on("end",()=>e())})}[Symbol.asyncIterator](){this[x]=!1;let e=!1,t=async()=>(this.pause(),e=!0,{value:void 0,done:!0});return{next:()=>{if(e)return t();let r=this.read();if(r!==null)return Promise.resolve({done:!1,value:r});if(this[le])return t();let n,o,h=c=>{this.off("data",a),this.off("end",l),this.off(y,u),t(),o(c)},a=c=>{this.off("error",h),this.off("end",l),this.off(y,u),this.pause(),n({value:c,done:!!this[le]})},l=()=>{this.off("error",h),this.off("data",a),this.off(y,u),t(),n({done:!0,value:void 0})},u=()=>h(new Error("stream destroyed"));return new Promise((c,E)=>{o=E,n=c,this.once(y,u),this.once("error",h),this.once("end",l),this.once("data",a)})},throw:t,return:t,[Symbol.asyncIterator](){return this},[Symbol.asyncDispose]:async()=>{}}}[Symbol.iterator](){this[x]=!1;let e=!1,t=()=>(this.pause(),this.off(Xi,t),this.off(y,t),this.off("end",t),e=!0,{done:!0,value:void 0}),i=()=>{if(e)return t();let r=this.read();return r===null?t():{done:!1,value:r}};return this.once("end",t),this.once(Xi,t),this.once(y,t),{next:i,throw:t,return:t,[Symbol.iterator](){return this},[Symbol.dispose]:()=>{}}}destroy(e){if(this[y])return e?this.emit("error",e):this.emit(y),this;this[y]=!0,this[x]=!0,this[R].length=0,this[v]=0;let t=this;return typeof t.close=="function"&&!this[jt]&&t.close(),e?this.emit("error",e):this.emit(y),this}static get isStream(){return F.isStream}};F.Minipass=Zt});var Ke=d(W=>{"use strict";var Ur=W&&W.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(W,"__esModule",{value:!0});W.WriteStreamSync=W.WriteStream=W.ReadStreamSync=W.ReadStream=void 0;var Co=Ur(__nccwpck_require__(4434)),z=Ur(__nccwpck_require__(9896)),Bo=We(),zo=z.default.writev,ye=Symbol("_autoClose"),$=Symbol("_close"),wt=Symbol("_ended"),p=Symbol("_fd"),ss=Symbol("_finished"),fe=Symbol("_flags"),rs=Symbol("_flush"),hs=Symbol("_handleChunk"),ls=Symbol("_makeBuf"),Et=Symbol("_mode"),Gt=Symbol("_needDrain"),Ge=Symbol("_onerror"),Ye=Symbol("_onopen"),ns=Symbol("_onread"),He=Symbol("_onwrite"),Ee=Symbol("_open"),V=Symbol("_path"),we=Symbol("_pos"),ee=Symbol("_queue"),Ze=Symbol("_read"),os=Symbol("_readSize"),ce=Symbol("_reading"),yt=Symbol("_remain"),as=Symbol("_size"),Yt=Symbol("_write"),Me=Symbol("_writing"),Kt=Symbol("_defaultFlag"),Le=Symbol("_errored"),Vt=class extends Bo.Minipass{[Le]=!1;[p];[V];[os];[ce]=!1;[as];[yt];[ye];constructor(e,t){if(t=t||{},super(t),this.readable=!0,this.writable=!1,typeof e!="string")throw new TypeError("path must be a string");this[Le]=!1,this[p]=typeof t.fd=="number"?t.fd:void 0,this[V]=e,this[os]=t.readSize||16*1024*1024,this[ce]=!1,this[as]=typeof t.size=="number"?t.size:1/0,this[yt]=this[as],this[ye]=typeof t.autoClose=="boolean"?t.autoClose:!0,typeof this[p]=="number"?this[Ze]():this[Ee]()}get fd(){return this[p]}get path(){return this[V]}write(){throw new TypeError("this is a readable stream")}end(){throw new TypeError("this is a readable stream")}[Ee](){z.default.open(this[V],"r",(e,t)=>this[Ye](e,t))}[Ye](e,t){e?this[Ge](e):(this[p]=t,this.emit("open",t),this[Ze]())}[ls](){return Buffer.allocUnsafe(Math.min(this[os],this[yt]))}[Ze](){if(!this[ce]){this[ce]=!0;let e=this[ls]();if(e.length===0)return process.nextTick(()=>this[ns](null,0,e));z.default.read(this[p],e,0,e.length,null,(t,i,r)=>this[ns](t,i,r))}}[ns](e,t,i){this[ce]=!1,e?this[Ge](e):this[hs](t,i)&&this[Ze]()}[$](){if(this[ye]&&typeof this[p]=="number"){let e=this[p];this[p]=void 0,z.default.close(e,t=>t?this.emit("error",t):this.emit("close"))}}[Ge](e){this[ce]=!0,this[$](),this.emit("error",e)}[hs](e,t){let i=!1;return this[yt]-=e,e>0&&(i=super.write(e<t.length?t.subarray(0,e):t)),(e===0||this[yt]<=0)&&(i=!1,this[$](),super.end()),i}emit(e,...t){switch(e){case"prefinish":case"finish":return!1;case"drain":return typeof this[p]=="number"&&this[Ze](),!1;case"error":return this[Le]?!1:(this[Le]=!0,super.emit(e,...t));default:return super.emit(e,...t)}}};W.ReadStream=Vt;var us=class extends Vt{[Ee](){let e=!0;try{this[Ye](null,z.default.openSync(this[V],"r")),e=!1}finally{e&&this[$]()}}[Ze](){let e=!0;try{if(!this[ce]){this[ce]=!0;do{let t=this[ls](),i=t.length===0?0:z.default.readSync(this[p],t,0,t.length,null);if(!this[hs](i,t))break}while(!0);this[ce]=!1}e=!1}finally{e&&this[$]()}}[$](){if(this[ye]&&typeof this[p]=="number"){let e=this[p];this[p]=void 0,z.default.closeSync(e),this.emit("close")}}};W.ReadStreamSync=us;var $t=class extends Co.default{readable=!1;writable=!0;[Le]=!1;[Me]=!1;[wt]=!1;[ee]=[];[Gt]=!1;[V];[Et];[ye];[p];[Kt];[fe];[ss]=!1;[we];constructor(e,t){t=t||{},super(t),this[V]=e,this[p]=typeof t.fd=="number"?t.fd:void 0,this[Et]=t.mode===void 0?438:t.mode,this[we]=typeof t.start=="number"?t.start:void 0,this[ye]=typeof t.autoClose=="boolean"?t.autoClose:!0;let i=this[we]!==void 0?"r+":"w";this[Kt]=t.flags===void 0,this[fe]=t.flags===void 0?i:t.flags,this[p]===void 0&&this[Ee]()}emit(e,...t){if(e==="error"){if(this[Le])return!1;this[Le]=!0}return super.emit(e,...t)}get fd(){return this[p]}get path(){return this[V]}[Ge](e){this[$](),this[Me]=!0,this.emit("error",e)}[Ee](){z.default.open(this[V],this[fe],this[Et],(e,t)=>this[Ye](e,t))}[Ye](e,t){this[Kt]&&this[fe]==="r+"&&e&&e.code==="ENOENT"?(this[fe]="w",this[Ee]()):e?this[Ge](e):(this[p]=t,this.emit("open",t),this[Me]||this[rs]())}end(e,t){return e&&this.write(e,t),this[wt]=!0,!this[Me]&&!this[ee].length&&typeof this[p]=="number"&&this[He](null,0),this}write(e,t){return typeof e=="string"&&(e=Buffer.from(e,t)),this[wt]?(this.emit("error",new Error("write() after end()")),!1):this[p]===void 0||this[Me]||this[ee].length?(this[ee].push(e),this[Gt]=!0,!1):(this[Me]=!0,this[Yt](e),!0)}[Yt](e){z.default.write(this[p],e,0,e.length,this[we],(t,i)=>this[He](t,i))}[He](e,t){e?this[Ge](e):(this[we]!==void 0&&typeof t=="number"&&(this[we]+=t),this[ee].length?this[rs]():(this[Me]=!1,this[wt]&&!this[ss]?(this[ss]=!0,this[$](),this.emit("finish")):this[Gt]&&(this[Gt]=!1,this.emit("drain"))))}[rs](){if(this[ee].length===0)this[wt]&&this[He](null,0);else if(this[ee].length===1)this[Yt](this[ee].pop());else{let e=this[ee];this[ee]=[],zo(this[p],e,this[we],(t,i)=>this[He](t,i))}}[$](){if(this[ye]&&typeof this[p]=="number"){let e=this[p];this[p]=void 0,z.default.close(e,t=>t?this.emit("error",t):this.emit("close"))}}};W.WriteStream=$t;var cs=class extends $t{[Ee](){let e;if(this[Kt]&&this[fe]==="r+")try{e=z.default.openSync(this[V],this[fe],this[Et])}catch(t){if(t?.code==="ENOENT")return this[fe]="w",this[Ee]();throw t}else e=z.default.openSync(this[V],this[fe],this[Et]);this[Ye](null,e)}[$](){if(this[ye]&&typeof this[p]=="number"){let e=this[p];this[p]=void 0,z.default.closeSync(e),this.emit("close")}}[Yt](e){let t=!0;try{this[He](null,z.default.writeSync(this[p],e,0,e.length,this[we])),t=!1}finally{if(t)try{this[$]()}catch{}}}};W.WriteStreamSync=cs});var Xt=d(b=>{"use strict";Object.defineProperty(b,"__esModule",{value:!0});b.dealias=b.isNoFile=b.isFile=b.isAsync=b.isSync=b.isAsyncNoFile=b.isSyncNoFile=b.isAsyncFile=b.isSyncFile=void 0;var ko=new Map([["C","cwd"],["f","file"],["z","gzip"],["P","preservePaths"],["U","unlink"],["strip-components","strip"],["stripComponents","strip"],["keep-newer","newer"],["keepNewer","newer"],["keep-newer-files","newer"],["keepNewerFiles","newer"],["k","keep"],["keep-existing","keep"],["keepExisting","keep"],["m","noMtime"],["no-mtime","noMtime"],["p","preserveOwner"],["L","follow"],["h","follow"],["onentry","onReadEntry"]]),xo=s=>!!s.sync&&!!s.file;b.isSyncFile=xo;var jo=s=>!s.sync&&!!s.file;b.isAsyncFile=jo;var Uo=s=>!!s.sync&&!s.file;b.isSyncNoFile=Uo;var qo=s=>!s.sync&&!s.file;b.isAsyncNoFile=qo;var Wo=s=>!!s.sync;b.isSync=Wo;var Ho=s=>!s.sync;b.isAsync=Ho;var Zo=s=>!!s.file;b.isFile=Zo;var Go=s=>!s.file;b.isNoFile=Go;var Yo=s=>{let e=ko.get(s);return e||s},Ko=(s={})=>{if(!s)return{};let e={};for(let[t,i]of Object.entries(s)){let r=Yo(t);e[r]=i}return e.chmod===void 0&&e.noChmod===!1&&(e.chmod=!0),delete e.noChmod,e};b.dealias=Ko});var Ve=d(Qt=>{"use strict";Object.defineProperty(Qt,"__esModule",{value:!0});Qt.makeCommand=void 0;var bt=Xt(),Vo=(s,e,t,i,r)=>Object.assign((n=[],o,h)=>{Array.isArray(n)&&(o=n,n={}),typeof o=="function"&&(h=o,o=void 0),o=o?Array.from(o):[];let a=(0,bt.dealias)(n);if(r?.(a,o),(0,bt.isSyncFile)(a)){if(typeof h=="function")throw new TypeError("callback not supported for sync tar functions");return s(a,o)}else if((0,bt.isAsyncFile)(a)){let l=e(a,o);return h?l.then(()=>h(),h):l}else if((0,bt.isSyncNoFile)(a)){if(typeof h=="function")throw new TypeError("callback not supported for sync tar functions");return t(a,o)}else if((0,bt.isAsyncNoFile)(a)){if(typeof h=="function")throw new TypeError("callback only supported with file option");return i(a,o)}throw new Error("impossible options??")},{syncFile:s,asyncFile:e,syncNoFile:t,asyncNoFile:i,validate:r});Qt.makeCommand=Vo});var fs=d($e=>{"use strict";var $o=$e&&$e.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty($e,"__esModule",{value:!0});$e.constants=void 0;var Xo=$o(__nccwpck_require__(3106)),Qo=Xo.default.constants||{ZLIB_VERNUM:4736};$e.constants=Object.freeze(Object.assign(Object.create(null),{Z_NO_FLUSH:0,Z_PARTIAL_FLUSH:1,Z_SYNC_FLUSH:2,Z_FULL_FLUSH:3,Z_FINISH:4,Z_BLOCK:5,Z_OK:0,Z_STREAM_END:1,Z_NEED_DICT:2,Z_ERRNO:-1,Z_STREAM_ERROR:-2,Z_DATA_ERROR:-3,Z_MEM_ERROR:-4,Z_BUF_ERROR:-5,Z_VERSION_ERROR:-6,Z_NO_COMPRESSION:0,Z_BEST_SPEED:1,Z_BEST_COMPRESSION:9,Z_DEFAULT_COMPRESSION:-1,Z_FILTERED:1,Z_HUFFMAN_ONLY:2,Z_RLE:3,Z_FIXED:4,Z_DEFAULT_STRATEGY:0,DEFLATE:1,INFLATE:2,GZIP:3,GUNZIP:4,DEFLATERAW:5,INFLATERAW:6,UNZIP:7,BROTLI_DECODE:8,BROTLI_ENCODE:9,Z_MIN_WINDOWBITS:8,Z_MAX_WINDOWBITS:15,Z_DEFAULT_WINDOWBITS:15,Z_MIN_CHUNK:64,Z_MAX_CHUNK:1/0,Z_DEFAULT_CHUNK:16384,Z_MIN_MEMLEVEL:1,Z_MAX_MEMLEVEL:9,Z_DEFAULT_MEMLEVEL:8,Z_MIN_LEVEL:-1,Z_MAX_LEVEL:9,Z_DEFAULT_LEVEL:-1,BROTLI_OPERATION_PROCESS:0,BROTLI_OPERATION_FLUSH:1,BROTLI_OPERATION_FINISH:2,BROTLI_OPERATION_EMIT_METADATA:3,BROTLI_MODE_GENERIC:0,BROTLI_MODE_TEXT:1,BROTLI_MODE_FONT:2,BROTLI_DEFAULT_MODE:0,BROTLI_MIN_QUALITY:0,BROTLI_MAX_QUALITY:11,BROTLI_DEFAULT_QUALITY:11,BROTLI_MIN_WINDOW_BITS:10,BROTLI_MAX_WINDOW_BITS:24,BROTLI_LARGE_MAX_WINDOW_BITS:30,BROTLI_DEFAULT_WINDOW:22,BROTLI_MIN_INPUT_BLOCK_BITS:16,BROTLI_MAX_INPUT_BLOCK_BITS:24,BROTLI_PARAM_MODE:0,BROTLI_PARAM_QUALITY:1,BROTLI_PARAM_LGWIN:2,BROTLI_PARAM_LGBLOCK:3,BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING:4,BROTLI_PARAM_SIZE_HINT:5,BROTLI_PARAM_LARGE_WINDOW:6,BROTLI_PARAM_NPOSTFIX:7,BROTLI_PARAM_NDIRECT:8,BROTLI_DECODER_RESULT_ERROR:0,BROTLI_DECODER_RESULT_SUCCESS:1,BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT:2,BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT:3,BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION:0,BROTLI_DECODER_PARAM_LARGE_WINDOW:1,BROTLI_DECODER_NO_ERROR:0,BROTLI_DECODER_SUCCESS:1,BROTLI_DECODER_NEEDS_MORE_INPUT:2,BROTLI_DECODER_NEEDS_MORE_OUTPUT:3,BROTLI_DECODER_ERROR_FORMAT_EXUBERANT_NIBBLE:-1,BROTLI_DECODER_ERROR_FORMAT_RESERVED:-2,BROTLI_DECODER_ERROR_FORMAT_EXUBERANT_META_NIBBLE:-3,BROTLI_DECODER_ERROR_FORMAT_SIMPLE_HUFFMAN_ALPHABET:-4,BROTLI_DECODER_ERROR_FORMAT_SIMPLE_HUFFMAN_SAME:-5,BROTLI_DECODER_ERROR_FORMAT_CL_SPACE:-6,BROTLI_DECODER_ERROR_FORMAT_HUFFMAN_SPACE:-7,BROTLI_DECODER_ERROR_FORMAT_CONTEXT_MAP_REPEAT:-8,BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_1:-9,BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_2:-10,BROTLI_DECODER_ERROR_FORMAT_TRANSFORM:-11,BROTLI_DECODER_ERROR_FORMAT_DICTIONARY:-12,BROTLI_DECODER_ERROR_FORMAT_WINDOW_BITS:-13,BROTLI_DECODER_ERROR_FORMAT_PADDING_1:-14,BROTLI_DECODER_ERROR_FORMAT_PADDING_2:-15,BROTLI_DECODER_ERROR_FORMAT_DISTANCE:-16,BROTLI_DECODER_ERROR_DICTIONARY_NOT_SET:-19,BROTLI_DECODER_ERROR_INVALID_ARGUMENTS:-20,BROTLI_DECODER_ERROR_ALLOC_CONTEXT_MODES:-21,BROTLI_DECODER_ERROR_ALLOC_TREE_GROUPS:-22,BROTLI_DECODER_ERROR_ALLOC_CONTEXT_MAP:-25,BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_1:-26,BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_2:-27,BROTLI_DECODER_ERROR_ALLOC_BLOCK_TYPE_TREES:-30,BROTLI_DECODER_ERROR_UNREACHABLE:-31},Qo))});var Ds=d(f=>{"use strict";var Jo=f&&f.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),ea=f&&f.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),ta=f&&f.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&Jo(t,e,i[r]);return ea(t,e),t}})(),ia=f&&f.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(f,"__esModule",{value:!0});f.ZstdDecompress=f.ZstdCompress=f.BrotliDecompress=f.BrotliCompress=f.Unzip=f.InflateRaw=f.DeflateRaw=f.Gunzip=f.Gzip=f.Inflate=f.Deflate=f.Zlib=f.ZlibError=f.constants=void 0;var ps=ia(__nccwpck_require__(2613)),Ae=__nccwpck_require__(181),sa=We(),qr=ta(__nccwpck_require__(3106)),te=fs(),ra=fs();Object.defineProperty(f,"constants",{enumerable:!0,get:function(){return ra.constants}});var na=Ae.Buffer.concat,Wr=Object.getOwnPropertyDescriptor(Ae.Buffer,"concat"),oa=s=>s,ds=Wr?.writable===!0||Wr?.set!==void 0?s=>{Ae.Buffer.concat=s?oa:na}:s=>{},Ie=Symbol("_superWrite"),Fe=class extends Error{code;errno;constructor(e,t){super("zlib: "+e.message,{cause:e}),this.code=e.code,this.errno=e.errno,this.code||(this.code="ZLIB_ERROR"),this.message="zlib: "+e.message,Error.captureStackTrace(this,t??this.constructor)}get name(){return"ZlibError"}};f.ZlibError=Fe;var ms=Symbol("flushFlag"),St=class extends sa.Minipass{#e=!1;#i=!1;#s;#n;#r;#t;#o;get sawError(){return this.#e}get handle(){return this.#t}get flushFlag(){return this.#s}constructor(e,t){if(!e||typeof e!="object")throw new TypeError("invalid options for ZlibBase constructor");if(super(e),this.#s=e.flush??0,this.#n=e.finishFlush??0,this.#r=e.fullFlushFlag??0,typeof qr[t]!="function")throw new TypeError("Compression method not supported: "+t);try{this.#t=new qr[t](e)}catch(i){throw new Fe(i,this.constructor)}this.#o=i=>{this.#e||(this.#e=!0,this.close(),this.emit("error",i))},this.#t?.on("error",i=>this.#o(new Fe(i))),this.once("end",()=>this.close)}close(){this.#t&&(this.#t.close(),this.#t=void 0,this.emit("close"))}reset(){if(!this.#e)return(0,ps.default)(this.#t,"zlib binding closed"),this.#t.reset?.()}flush(e){this.ended||(typeof e!="number"&&(e=this.#r),this.write(Object.assign(Ae.Buffer.alloc(0),{[ms]:e})))}end(e,t,i){return typeof e=="function"&&(i=e,t=void 0,e=void 0),typeof t=="function"&&(i=t,t=void 0),e&&(t?this.write(e,t):this.write(e)),this.flush(this.#n),this.#i=!0,super.end(i)}get ended(){return this.#i}[Ie](e){return super.write(e)}write(e,t,i){if(typeof t=="function"&&(i=t,t="utf8"),typeof e=="string"&&(e=Ae.Buffer.from(e,t)),this.#e)return;(0,ps.default)(this.#t,"zlib binding closed");let r=this.#t._handle,n=r.close;r.close=()=>{};let o=this.#t.close;this.#t.close=()=>{},ds(!0);let h;try{let l=typeof e[ms]=="number"?e[ms]:this.#s;h=this.#t._processChunk(e,l),ds(!1)}catch(l){ds(!1),this.#o(new Fe(l,this.write))}finally{this.#t&&(this.#t._handle=r,r.close=n,this.#t.close=o,this.#t.removeAllListeners("error"))}this.#t&&this.#t.on("error",l=>this.#o(new Fe(l,this.write)));let a;if(h)if(Array.isArray(h)&&h.length>0){let l=h[0];a=this[Ie](Ae.Buffer.from(l));for(let u=1;u<h.length;u++)a=this[Ie](h[u])}else a=this[Ie](Ae.Buffer.from(h));return i&&i(),a}},ie=class extends St{#e;#i;constructor(e,t){e=e||{},e.flush=e.flush||te.constants.Z_NO_FLUSH,e.finishFlush=e.finishFlush||te.constants.Z_FINISH,e.fullFlushFlag=te.constants.Z_FULL_FLUSH,super(e,t),this.#e=e.level,this.#i=e.strategy}params(e,t){if(!this.sawError){if(!this.handle)throw new Error("cannot switch params when binding is closed");if(!this.handle.params)throw new Error("not supported in this implementation");if(this.#e!==e||this.#i!==t){this.flush(te.constants.Z_SYNC_FLUSH),(0,ps.default)(this.handle,"zlib binding closed");let i=this.handle.flush;this.handle.flush=(r,n)=>{typeof r=="function"&&(n=r,r=this.flushFlag),this.flush(r),n?.()};try{this.handle.params(e,t)}finally{this.handle.flush=i}this.handle&&(this.#e=e,this.#i=t)}}}};f.Zlib=ie;var _s=class extends ie{constructor(e){super(e,"Deflate")}};f.Deflate=_s;var ws=class extends ie{constructor(e){super(e,"Inflate")}};f.Inflate=ws;var ys=class extends ie{#e;constructor(e){super(e,"Gzip"),this.#e=e&&!!e.portable}[Ie](e){return this.#e?(this.#e=!1,e[9]=255,super[Ie](e)):super[Ie](e)}};f.Gzip=ys;var Es=class extends ie{constructor(e){super(e,"Gunzip")}};f.Gunzip=Es;var bs=class extends ie{constructor(e){super(e,"DeflateRaw")}};f.DeflateRaw=bs;var Ss=class extends ie{constructor(e){super(e,"InflateRaw")}};f.InflateRaw=Ss;var gs=class extends ie{constructor(e){super(e,"Unzip")}};f.Unzip=gs;var Jt=class extends St{constructor(e,t){e=e||{},e.flush=e.flush||te.constants.BROTLI_OPERATION_PROCESS,e.finishFlush=e.finishFlush||te.constants.BROTLI_OPERATION_FINISH,e.fullFlushFlag=te.constants.BROTLI_OPERATION_FLUSH,super(e,t)}},Os=class extends Jt{constructor(e){super(e,"BrotliCompress")}};f.BrotliCompress=Os;var Rs=class extends Jt{constructor(e){super(e,"BrotliDecompress")}};f.BrotliDecompress=Rs;var ei=class extends St{constructor(e,t){e=e||{},e.flush=e.flush||te.constants.ZSTD_e_continue,e.finishFlush=e.finishFlush||te.constants.ZSTD_e_end,e.fullFlushFlag=te.constants.ZSTD_e_flush,super(e,t)}},vs=class extends ei{constructor(e){super(e,"ZstdCompress")}};f.ZstdCompress=vs;var Ts=class extends ei{constructor(e){super(e,"ZstdDecompress")}};f.ZstdDecompress=Ts});var Gr=d(Xe=>{"use strict";Object.defineProperty(Xe,"__esModule",{value:!0});Xe.parse=Xe.encode=void 0;var aa=(s,e)=>{if(Number.isSafeInteger(s))s<0?la(s,e):ha(s,e);else throw Error("cannot encode number outside of javascript safe integer range");return e};Xe.encode=aa;var ha=(s,e)=>{e[0]=128;for(var t=e.length;t>1;t--)e[t-1]=s&255,s=Math.floor(s/256)},la=(s,e)=>{e[0]=255;var t=!1;s=s*-1;for(var i=e.length;i>1;i--){var r=s&255;s=Math.floor(s/256),t?e[i-1]=Hr(r):r===0?e[i-1]=0:(t=!0,e[i-1]=Zr(r))}},ua=s=>{let e=s[0],t=e===128?fa(s.subarray(1,s.length)):e===255?ca(s):null;if(t===null)throw Error("invalid base256 encoding");if(!Number.isSafeInteger(t))throw Error("parsed number outside of javascript safe integer range");return t};Xe.parse=ua;var ca=s=>{for(var e=s.length,t=0,i=!1,r=e-1;r>-1;r--){var n=Number(s[r]),o;i?o=Hr(n):n===0?o=n:(i=!0,o=Zr(n)),o!==0&&(t-=o*Math.pow(256,e-r-1))}return t},fa=s=>{for(var e=s.length,t=0,i=e-1;i>-1;i--){var r=Number(s[i]);r!==0&&(t+=r*Math.pow(256,e-i-1))}return t},Hr=s=>(255^s)&255,Zr=s=>(255^s)+1&255});var Ps=d(C=>{"use strict";Object.defineProperty(C,"__esModule",{value:!0});C.code=C.name=C.normalFsTypes=C.isName=C.isCode=void 0;var da=s=>C.name.has(s);C.isCode=da;var ma=s=>C.code.has(s);C.isName=ma;C.normalFsTypes=new Set(["0","","1","2","3","4","5","6","7","D"]);C.name=new Map([["0","File"],["","OldFile"],["1","Link"],["2","SymbolicLink"],["3","CharacterDevice"],["4","BlockDevice"],["5","Directory"],["6","FIFO"],["7","ContiguousFile"],["g","GlobalExtendedHeader"],["x","ExtendedHeader"],["A","SolarisACL"],["D","GNUDumpDir"],["I","Inode"],["K","NextFileHasLongLinkpath"],["L","NextFileHasLongPath"],["M","ContinuationFile"],["N","OldGnuLongPath"],["S","SparseFile"],["V","TapeVolumeHeader"],["X","OldExtendedHeader"]]);C.code=new Map(Array.from(C.name).map(s=>[s[1],s[0]]))});var et=d(se=>{"use strict";var pa=se&&se.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),_a=se&&se.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),Yr=se&&se.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&pa(t,e,i[r]);return _a(t,e),t}})();Object.defineProperty(se,"__esModule",{value:!0});se.Header=void 0;var Qe=__nccwpck_require__(6760),Kr=Yr(Gr()),Je=Yr(Ps()),Ls=class{cksumValid=!1;needPax=!1;nullBlock=!1;block;path;mode;uid;gid;size;cksum;#e="Unsupported";linkpath;uname;gname;devmaj=0;devmin=0;atime;ctime;mtime;charset;comment;constructor(e,t=0,i,r){Buffer.isBuffer(e)?this.decode(e,t||0,i,r):e&&this.#i(e)}decode(e,t,i,r){if(t||(t=0),!e||!(e.length>=t+512))throw new Error("need 512 bytes for header");let n=Ce(e,t+156,1),o=Je.normalFsTypes.has(n),h=o?i:void 0,a=o?r:void 0;if(this.path=h?.path??Ce(e,t,100),this.mode=h?.mode??a?.mode??be(e,t+100,8),this.uid=h?.uid??a?.uid??be(e,t+108,8),this.gid=h?.gid??a?.gid??be(e,t+116,8),this.size=h?.size??a?.size??be(e,t+124,12),this.mtime=h?.mtime??a?.mtime??Ns(e,t+136,12),this.cksum=be(e,t+148,12),a&&this.#i(a,!0),h&&this.#i(h),Je.isCode(n)&&(this.#e=n||"0"),this.#e==="0"&&this.path.slice(-1)==="/"&&(this.#e="5"),this.#e==="5"&&(this.size=0),this.linkpath=Ce(e,t+157,100),e.subarray(t+257,t+265).toString()==="ustar\x0000")if(this.uname=h?.uname??a?.uname??Ce(e,t+265,32),this.gname=h?.gname??a?.gname??Ce(e,t+297,32),this.devmaj=h?.devmaj??a?.devmaj??be(e,t+329,8)??0,this.devmin=h?.devmin??a?.devmin??be(e,t+337,8)??0,e[t+475]!==0){let u=Ce(e,t+345,155);this.path=u+"/"+this.path}else{let u=Ce(e,t+345,130);u&&(this.path=u+"/"+this.path),this.atime=i?.atime??r?.atime??Ns(e,t+476,12),this.ctime=i?.ctime??r?.ctime??Ns(e,t+488,12)}let l=256;for(let u=t;u<t+148;u++)l+=e[u];for(let u=t+156;u<t+512;u++)l+=e[u];this.cksumValid=l===this.cksum,this.cksum===void 0&&l===256&&(this.nullBlock=!0)}#i(e,t=!1){Object.assign(this,Object.fromEntries(Object.entries(e).filter(([i,r])=>!(r==null||i==="path"&&t||i==="linkpath"&&t||i==="global"))))}encode(e,t=0){if(e||(e=this.block=Buffer.alloc(512)),this.#e==="Unsupported"&&(this.#e="0"),!(e.length>=t+512))throw new Error("need 512 bytes for header");let i=this.ctime||this.atime?130:155,r=wa(this.path||"",i),n=r[0],o=r[1];this.needPax=!!r[2],this.needPax=Be(e,t,100,n)||this.needPax,this.needPax=Se(e,t+100,8,this.mode)||this.needPax,this.needPax=Se(e,t+108,8,this.uid)||this.needPax,this.needPax=Se(e,t+116,8,this.gid)||this.needPax,this.needPax=Se(e,t+124,12,this.size)||this.needPax,this.needPax=Ms(e,t+136,12,this.mtime)||this.needPax,e[t+156]=Number(this.#e.codePointAt(0)),this.needPax=Be(e,t+157,100,this.linkpath)||this.needPax,e.write("ustar\x0000",t+257,8),this.needPax=Be(e,t+265,32,this.uname)||this.needPax,this.needPax=Be(e,t+297,32,this.gname)||this.needPax,this.needPax=Se(e,t+329,8,this.devmaj)||this.needPax,this.needPax=Se(e,t+337,8,this.devmin)||this.needPax,this.needPax=Be(e,t+345,i,o)||this.needPax,e[t+475]!==0?this.needPax=Be(e,t+345,155,o)||this.needPax:(this.needPax=Be(e,t+345,130,o)||this.needPax,this.needPax=Ms(e,t+476,12,this.atime)||this.needPax,this.needPax=Ms(e,t+488,12,this.ctime)||this.needPax);let h=256;for(let a=t;a<t+148;a++)h+=e[a];for(let a=t+156;a<t+512;a++)h+=e[a];return this.cksum=h,Se(e,t+148,8,this.cksum),this.cksumValid=!0,this.needPax}get type(){return this.#e==="Unsupported"?this.#e:Je.name.get(this.#e)}get typeKey(){return this.#e}set type(e){let t=String(Je.code.get(e));if(Je.isCode(t)||t==="Unsupported")this.#e=t;else if(Je.isCode(e))this.#e=e;else throw new TypeError("invalid entry type: "+e)}};se.Header=Ls;var wa=(s,e)=>{let i=s,r="",n,o=Qe.posix.parse(s).root||".";if(Buffer.byteLength(i)<100)n=[i,r,!1];else{r=Qe.posix.dirname(i),i=Qe.posix.basename(i);do Buffer.byteLength(i)<=100&&Buffer.byteLength(r)<=e?n=[i,r,!1]:Buffer.byteLength(i)>100&&Buffer.byteLength(r)<=e?n=[i.slice(0,99),r,!0]:(i=Qe.posix.join(Qe.posix.basename(r),i),r=Qe.posix.dirname(r));while(r!==o&&n===void 0);n||(n=[s.slice(0,99),"",!0])}return n},Ce=(s,e,t)=>s.subarray(e,e+t).toString("utf8").replace(/\0.*/,""),Ns=(s,e,t)=>ya(be(s,e,t)),ya=s=>s===void 0?void 0:new Date(s*1e3),be=(s,e,t)=>Number(s[e])&128?Kr.parse(s.subarray(e,e+t)):ba(s,e,t),Ea=s=>isNaN(s)?void 0:s,ba=(s,e,t)=>Ea(parseInt(s.subarray(e,e+t).toString("utf8").replace(/\0.*$/,"").trim(),8)),Sa={12:8589934591,8:2097151},Se=(s,e,t,i)=>i===void 0?!1:i>Sa[t]||i<0?(Kr.encode(i,s.subarray(e,e+t)),!0):(ga(s,e,t,i),!1),ga=(s,e,t,i)=>s.write(Oa(i,t),e,t,"ascii"),Oa=(s,e)=>Ra(Math.floor(s).toString(8),e),Ra=(s,e)=>(s.length===e-1?s:new Array(e-s.length-1).join("0")+s+" ")+"\0",Ms=(s,e,t,i)=>i===void 0?!1:Se(s,e,t,i.getTime()/1e3),va=new Array(156).join("\0"),Be=(s,e,t,i)=>i===void 0?!1:(s.write(i+va,e,t,"utf8"),i.length!==Buffer.byteLength(i)||i.length>t)});var ii=d(ti=>{"use strict";Object.defineProperty(ti,"__esModule",{value:!0});ti.Pax=void 0;var Ta=__nccwpck_require__(6760),Da=et(),As=class s{atime;mtime;ctime;charset;comment;gid;uid;gname;uname;linkpath;dev;ino;nlink;path;size;mode;global;constructor(e,t=!1){this.atime=e.atime,this.charset=e.charset,this.comment=e.comment,this.ctime=e.ctime,this.dev=e.dev,this.gid=e.gid,this.global=t,this.gname=e.gname,this.ino=e.ino,this.linkpath=e.linkpath,this.mtime=e.mtime,this.nlink=e.nlink,this.path=e.path,this.size=e.size,this.uid=e.uid,this.uname=e.uname}encode(){let e=this.encodeBody();if(e==="")return Buffer.allocUnsafe(0);let t=Buffer.byteLength(e),i=512*Math.ceil(1+t/512),r=Buffer.allocUnsafe(i);for(let n=0;n<512;n++)r[n]=0;new Da.Header({path:("PaxHeader/"+(0,Ta.basename)(this.path??"")).slice(0,99),mode:this.mode||420,uid:this.uid,gid:this.gid,size:t,mtime:this.mtime,type:this.global?"GlobalExtendedHeader":"ExtendedHeader",linkpath:"",uname:this.uname||"",gname:this.gname||"",devmaj:0,devmin:0,atime:this.atime,ctime:this.ctime}).encode(r),r.write(e,512,t,"utf8");for(let n=t+512;n<r.length;n++)r[n]=0;return r}encodeBody(){return this.encodeField("path")+this.encodeField("ctime")+this.encodeField("atime")+this.encodeField("dev")+this.encodeField("ino")+this.encodeField("nlink")+this.encodeField("charset")+this.encodeField("comment")+this.encodeField("gid")+this.encodeField("gname")+this.encodeField("linkpath")+this.encodeField("mtime")+this.encodeField("size")+this.encodeField("uid")+this.encodeField("uname")}encodeField(e){if(this[e]===void 0)return"";let t=this[e],i=t instanceof Date?t.getTime()/1e3:t,r=" "+(e==="dev"||e==="ino"||e==="nlink"?"SCHILY.":"")+e+"="+i+`
-`,n=Buffer.byteLength(r),o=Math.floor(Math.log(n)/Math.log(10))+1;return n+o>=Math.pow(10,o)&&(o+=1),o+n+r}static parse(e,t,i=!1){return new s(Pa(Na(e),t),i)}};ti.Pax=As;var Pa=(s,e)=>e?Object.assign({},e,s):s,Na=s=>s.replace(/\n$/,"").split(`
-`).reduce(Ma,Object.create(null)),Ma=(s,e)=>{let t=parseInt(e,10);if(t!==Buffer.byteLength(e)+1)return s;e=e.slice((t+" ").length);let i=e.split("="),r=i.shift();if(!r)return s;let n=r.replace(/^SCHILY\.(dev|ino|nlink)/,"$1"),o=i.join("=");return s[n]=/^([A-Z]+\.)?([mac]|birth|creation)time$/.test(n)?new Date(Number(o)*1e3):/^[0-9]+$/.test(o)?+o:o,s}});var tt=d(si=>{"use strict";Object.defineProperty(si,"__esModule",{value:!0});si.normalizeWindowsPath=void 0;var La=process.env.TESTING_TAR_FAKE_PLATFORM||process.platform;si.normalizeWindowsPath=La!=="win32"?s=>s:s=>s&&s.replaceAll(/\\/g,"/")});var Fs=d(ni=>{"use strict";Object.defineProperty(ni,"__esModule",{value:!0});ni.ReadEntry=void 0;var Aa=We(),ri=tt(),Is=class extends Aa.Minipass{extended;globalExtended;header;startBlockSize;blockRemain;remain;type;meta=!1;ignore=!1;path;mode;uid;gid;uname;gname;size=0;mtime;atime;ctime;linkpath;dev;ino;nlink;invalid=!1;absolute;unsupported=!1;constructor(e,t,i){switch(super({}),this.pause(),this.extended=t,this.globalExtended=i,this.header=e,this.remain=e.size??0,this.startBlockSize=512*Math.ceil(this.remain/512),this.blockRemain=this.startBlockSize,this.type=e.type,this.type){case"File":case"OldFile":case"Link":case"SymbolicLink":case"CharacterDevice":case"BlockDevice":case"Directory":case"FIFO":case"ContiguousFile":case"GNUDumpDir":break;case"NextFileHasLongLinkpath":case"NextFileHasLongPath":case"OldGnuLongPath":case"GlobalExtendedHeader":case"ExtendedHeader":case"OldExtendedHeader":this.meta=!0;break;default:this.ignore=!0}if(!e.path)throw new Error("no path provided for tar.ReadEntry");this.path=(0,ri.normalizeWindowsPath)(e.path),this.mode=e.mode,this.mode&&(this.mode=this.mode&4095),this.uid=e.uid,this.gid=e.gid,this.uname=e.uname,this.gname=e.gname,this.size=this.remain,this.mtime=e.mtime,this.atime=e.atime,this.ctime=e.ctime,this.linkpath=e.linkpath?(0,ri.normalizeWindowsPath)(e.linkpath):void 0,this.uname=e.uname,this.gname=e.gname,t&&this.#e(t),i&&this.#e(i,!0)}write(e){let t=e.length;if(t>this.blockRemain)throw new Error("writing more to entry than is appropriate");let i=this.remain,r=this.blockRemain;return this.remain=Math.max(0,i-t),this.blockRemain=Math.max(0,r-t),this.ignore?!0:i>=t?super.write(e):super.write(e.subarray(0,i))}#e(e,t=!1){e.path&&(e.path=(0,ri.normalizeWindowsPath)(e.path)),e.linkpath&&(e.linkpath=(0,ri.normalizeWindowsPath)(e.linkpath)),Object.assign(this,Object.fromEntries(Object.entries(e).filter(([i,r])=>!(r==null||i==="path"&&t))))}};ni.ReadEntry=Is});var ai=d(oi=>{"use strict";Object.defineProperty(oi,"__esModule",{value:!0});oi.warnMethod=void 0;var Ia=(s,e,t,i={})=>{s.file&&(i.file=s.file),s.cwd&&(i.cwd=s.cwd),i.code=t instanceof Error&&t.code||e,i.tarCode=e,!s.strict&&i.recoverable!==!1?(t instanceof Error&&(i=Object.assign(t,i),t=t.message),s.emit("warn",e,t,i)):t instanceof Error?s.emit("error",Object.assign(t,i)):s.emit("error",Object.assign(new Error(`${e}: ${t}`),i))};oi.warnMethod=Ia});var pi=d(mi=>{"use strict";Object.defineProperty(mi,"__esModule",{value:!0});mi.Parser=void 0;var Fa=__nccwpck_require__(4434),Cs=Ds(),Vr=et(),$r=ii(),Ca=Fs(),Ba=ai(),za=1024*1024,js=Buffer.from([31,139]),Us=Buffer.from([40,181,47,253]),ka=Math.max(js.length,Us.length),H=Symbol("state"),ze=Symbol("writeEntry"),de=Symbol("readEntry"),Bs=Symbol("nextEntry"),Xr=Symbol("processEntry"),re=Symbol("extendedHeader"),gt=Symbol("globalExtendedHeader"),ge=Symbol("meta"),Qr=Symbol("emitMeta"),_=Symbol("buffer"),me=Symbol("queue"),Oe=Symbol("ended"),zs=Symbol("emittedEnd"),ke=Symbol("emit"),S=Symbol("unzip"),hi=Symbol("consumeChunk"),li=Symbol("consumeChunkSub"),ks=Symbol("consumeBody"),Jr=Symbol("consumeMeta"),en=Symbol("consumeHeader"),Ot=Symbol("consuming"),xs=Symbol("bufferConcat"),ui=Symbol("maybeEnd"),it=Symbol("writing"),Re=Symbol("aborted"),ci=Symbol("onDone"),xe=Symbol("sawValidEntry"),fi=Symbol("sawNullBlock"),di=Symbol("sawEOF"),tn=Symbol("closeStream"),xa=()=>!0,qs=class extends Fa.EventEmitter{file;strict;maxMetaEntrySize;filter;brotli;zstd;writable=!0;readable=!1;[me]=[];[_];[de];[ze];[H]="begin";[ge]="";[re];[gt];[Oe]=!1;[S];[Re]=!1;[xe];[fi]=!1;[di]=!1;[it]=!1;[Ot]=!1;[zs]=!1;constructor(e={}){super(),this.file=e.file||"",this.on(ci,()=>{(this[H]==="begin"||this[xe]===!1)&&this.warn("TAR_BAD_ARCHIVE","Unrecognized archive format")}),e.ondone?this.on(ci,e.ondone):this.on(ci,()=>{this.emit("prefinish"),this.emit("finish"),this.emit("end")}),this.strict=!!e.strict,this.maxMetaEntrySize=e.maxMetaEntrySize||za,this.filter=typeof e.filter=="function"?e.filter:xa;let t=e.file&&(e.file.endsWith(".tar.br")||e.file.endsWith(".tbr"));this.brotli=!(e.gzip||e.zstd)&&e.brotli!==void 0?e.brotli:t?void 0:!1;let i=e.file&&(e.file.endsWith(".tar.zst")||e.file.endsWith(".tzst"));this.zstd=!(e.gzip||e.brotli)&&e.zstd!==void 0?e.zstd:i?!0:void 0,this.on("end",()=>this[tn]()),typeof e.onwarn=="function"&&this.on("warn",e.onwarn),typeof e.onReadEntry=="function"&&this.on("entry",e.onReadEntry)}warn(e,t,i={}){(0,Ba.warnMethod)(this,e,t,i)}[en](e,t){this[xe]===void 0&&(this[xe]=!1);let i;try{i=new Vr.Header(e,t,this[re],this[gt])}catch(r){return this.warn("TAR_ENTRY_INVALID",r)}if(i.nullBlock)this[fi]?(this[di]=!0,this[H]==="begin"&&(this[H]="header"),this[ke]("eof")):(this[fi]=!0,this[ke]("nullBlock"));else if(this[fi]=!1,!i.cksumValid)this.warn("TAR_ENTRY_INVALID","checksum failure",{header:i});else if(!i.path)this.warn("TAR_ENTRY_INVALID","path is required",{header:i});else{let r=i.type;if(/^(Symbolic)?Link$/.test(r)&&!i.linkpath)this.warn("TAR_ENTRY_INVALID","linkpath required",{header:i});else if(!/^(Symbolic)?Link$/.test(r)&&!/^(Global)?ExtendedHeader$/.test(r)&&i.linkpath)this.warn("TAR_ENTRY_INVALID","linkpath forbidden",{header:i});else{let n=this[ze]=new Ca.ReadEntry(i,this[re],this[gt]);if(!this[xe])if(n.remain){let o=()=>{n.invalid||(this[xe]=!0)};n.on("end",o)}else this[xe]=!0;n.meta?n.size>this.maxMetaEntrySize?(n.ignore=!0,this[ke]("ignoredEntry",n),this[H]="ignore",n.resume()):n.size>0&&(this[ge]="",n.on("data",o=>this[ge]+=o),this[H]="meta"):(this[re]=void 0,n.ignore=n.ignore||!this.filter(n.path,n),n.ignore?(this[ke]("ignoredEntry",n),this[H]=n.remain?"ignore":"header",n.resume()):(n.remain?this[H]="body":(this[H]="header",n.end()),this[de]?this[me].push(n):(this[me].push(n),this[Bs]())))}}}[tn](){queueMicrotask(()=>this.emit("close"))}[Xr](e){let t=!0;if(!e)this[de]=void 0,t=!1;else if(Array.isArray(e)){let[i,...r]=e;this.emit(i,...r)}else this[de]=e,this.emit("entry",e),e.emittedEnd||(e.on("end",()=>this[Bs]()),t=!1);return t}[Bs](){do;while(this[Xr](this[me].shift()));if(this[me].length===0){let e=this[de];!e||e.flowing||e.size===e.remain?this[it]||this.emit("drain"):e.once("drain",()=>this.emit("drain"))}}[ks](e,t){let i=this[ze];if(!i)throw new Error("attempt to consume body without entry??");let r=i.blockRemain??0,n=r>=e.length&&t===0?e:e.subarray(t,t+r);return i.write(n),i.blockRemain||(this[H]="header",this[ze]=void 0,i.end()),n.length}[Jr](e,t){let i=this[ze],r=this[ks](e,t);return!this[ze]&&i&&this[Qr](i),r}[ke](e,t,i){this[me].length===0&&!this[de]?this.emit(e,t,i):this[me].push([e,t,i])}[Qr](e){switch(this[ke]("meta",this[ge]),e.type){case"ExtendedHeader":case"OldExtendedHeader":this[re]=$r.Pax.parse(this[ge],this[re],!1);break;case"GlobalExtendedHeader":this[gt]=$r.Pax.parse(this[ge],this[gt],!0);break;case"NextFileHasLongPath":case"OldGnuLongPath":{let t=this[re]??Object.create(null);this[re]=t,t.path=this[ge].replace(/\0.*/,"");break}case"NextFileHasLongLinkpath":{let t=this[re]||Object.create(null);this[re]=t,t.linkpath=this[ge].replace(/\0.*/,"");break}default:throw new Error("unknown meta: "+e.type)}}abort(e){this[Re]=!0,this.emit("abort",e),this.warn("TAR_ABORT",e,{recoverable:!1})}write(e,t,i){if(typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,typeof t=="string"?t:"utf8")),this[Re])return i?.(),!1;if((this[S]===void 0||this.brotli===void 0&&this[S]===!1)&&e){if(this[_]&&(e=Buffer.concat([this[_],e]),this[_]=void 0),e.length<ka)return this[_]=e,i?.(),!0;for(let a=0;this[S]===void 0&&a<js.length;a++)e[a]!==js[a]&&(this[S]=!1);let o=!1;if(this[S]===!1&&this.zstd!==!1){o=!0;for(let a=0;a<Us.length;a++)if(e[a]!==Us[a]){o=!1;break}}let h=this.brotli===void 0&&!o;if(this[S]===!1&&h)if(e.length<512)if(this[Oe])this.brotli=!0;else return this[_]=e,i?.(),!0;else try{new Vr.Header(e.subarray(0,512)),this.brotli=!1}catch{this.brotli=!0}if(this[S]===void 0||this[S]===!1&&(this.brotli||o)){let a=this[Oe];this[Oe]=!1,this[S]=this[S]===void 0?new Cs.Unzip({}):o?new Cs.ZstdDecompress({}):new Cs.BrotliDecompress({}),this[S].on("data",u=>this[hi](u)),this[S].on("error",u=>this.abort(u)),this[S].on("end",()=>{this[Oe]=!0,this[hi]()}),this[it]=!0;let l=!!this[S][a?"end":"write"](e);return this[it]=!1,i?.(),l}}this[it]=!0,this[S]?this[S].write(e):this[hi](e),this[it]=!1;let n=this[me].length>0?!1:this[de]?this[de].flowing:!0;return!n&&this[me].length===0&&this[de]?.once("drain",()=>this.emit("drain")),i?.(),n}[xs](e){e&&!this[Re]&&(this[_]=this[_]?Buffer.concat([this[_],e]):e)}[ui](){if(this[Oe]&&!this[zs]&&!this[Re]&&!this[Ot]){this[zs]=!0;let e=this[ze];if(e&&e.blockRemain){let t=this[_]?this[_].length:0;this.warn("TAR_BAD_ARCHIVE",`Truncated input (needed ${e.blockRemain} more bytes, only ${t} available)`,{entry:e}),this[_]&&e.write(this[_]),e.end()}this[ke](ci)}}[hi](e){if(this[Ot]&&e)this[xs](e);else if(!e&&!this[_])this[ui]();else if(e){if(this[Ot]=!0,this[_]){this[xs](e);let t=this[_];this[_]=void 0,this[li](t)}else this[li](e);for(;this[_]&&this[_]?.length>=512&&!this[Re]&&!this[di];){let t=this[_];this[_]=void 0,this[li](t)}this[Ot]=!1}(!this[_]||this[Oe])&&this[ui]()}[li](e){let t=0,i=e.length;for(;t+512<=i&&!this[Re]&&!this[di];)switch(this[H]){case"begin":case"header":this[en](e,t),t+=512;break;case"ignore":case"body":t+=this[ks](e,t);break;case"meta":t+=this[Jr](e,t);break;default:throw new Error("invalid state: "+this[H])}t<i&&(this[_]=this[_]?Buffer.concat([e.subarray(t),this[_]]):e.subarray(t))}end(e,t,i){return typeof e=="function"&&(i=e,t=void 0,e=void 0),typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,t)),i&&this.once("finish",i),this[Re]||(this[S]?(e&&this[S].write(e),this[S].end()):(this[Oe]=!0,(this.brotli===void 0||this.zstd===void 0)&&(e=e||Buffer.alloc(0)),e&&this.write(e),this[ui]())),this}};mi.Parser=qs});var wi=d(_i=>{"use strict";Object.defineProperty(_i,"__esModule",{value:!0});_i.stripTrailingSlashes=void 0;var ja=s=>{let e=s.length-1,t=-1;for(;e>-1&&s.charAt(e)==="/";)t=e,e--;return t===-1?s:s.slice(0,t)};_i.stripTrailingSlashes=ja});var rt=d(B=>{"use strict";var Ua=B&&B.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),qa=B&&B.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),Wa=B&&B.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&Ua(t,e,i[r]);return qa(t,e),t}})(),Ha=B&&B.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(B,"__esModule",{value:!0});B.list=B.filesFilter=void 0;var Za=Wa(Ke()),st=Ha(__nccwpck_require__(3024)),sn=__nccwpck_require__(6928),Ga=Ve(),yi=pi(),Ws=wi(),Ya=s=>{let e=s.onReadEntry;s.onReadEntry=e?t=>{e(t),t.resume()}:t=>t.resume()},Ka=(s,e)=>{let t=new Map(e.map(n=>[(0,Ws.stripTrailingSlashes)(n),!0])),i=s.filter,r=(n,o="")=>{let h=o||(0,sn.parse)(n).root||".",a;if(n===h)a=!1;else{let l=t.get(n);a=l!==void 0?l:r((0,sn.dirname)(n),h)}return t.set(n,a),a};s.filter=i?(n,o)=>i(n,o)&&r((0,Ws.stripTrailingSlashes)(n)):n=>r((0,Ws.stripTrailingSlashes)(n))};B.filesFilter=Ka;var Va=s=>{let e=new yi.Parser(s),t=s.file,i;try{i=st.default.openSync(t,"r");let r=st.default.fstatSync(i),n=s.maxReadSize||16*1024*1024;if(r.size<n){let o=Buffer.allocUnsafe(r.size),h=st.default.readSync(i,o,0,r.size,0);e.end(h===o.byteLength?o:o.subarray(0,h))}else{let o=0,h=Buffer.allocUnsafe(n);for(;o<r.size;){let a=st.default.readSync(i,h,0,n,o);if(a===0)break;o+=a,e.write(h.subarray(0,a))}e.end()}}finally{if(typeof i=="number")try{st.default.closeSync(i)}catch{}}},$a=(s,e)=>{let t=new yi.Parser(s),i=s.maxReadSize||16*1024*1024,r=s.file;return new Promise((o,h)=>{t.on("error",h),t.on("end",o),st.default.stat(r,(a,l)=>{if(a)h(a);else{let u=new Za.ReadStream(r,{readSize:i,size:l.size});u.on("error",h),u.pipe(t)}})})};B.list=(0,Ga.makeCommand)(Va,$a,s=>new yi.Parser(s),s=>new yi.Parser(s),(s,e)=>{e?.length&&(0,B.filesFilter)(s,e),s.noResume||Ya(s)})});var rn=d(Ei=>{"use strict";Object.defineProperty(Ei,"__esModule",{value:!0});Ei.modeFix=void 0;var Xa=(s,e,t)=>(s&=4095,t&&(s=(s|384)&-19),e&&(s&256&&(s|=64),s&32&&(s|=8),s&4&&(s|=1)),s);Ei.modeFix=Xa});var Hs=d(bi=>{"use strict";Object.defineProperty(bi,"__esModule",{value:!0});bi.stripAbsolutePath=void 0;var Qa=__nccwpck_require__(6760),{isAbsolute:Ja,parse:nn}=Qa.win32,eh=s=>{let e="",t=nn(s);for(;Ja(s)||t.root;){let i=s.charAt(0)==="/"&&s.slice(0,4)!=="//?/"?"/":t.root;s=s.slice(i.length),e+=i,t=nn(s)}return[e,s]};bi.stripAbsolutePath=eh});var Gs=d(nt=>{"use strict";Object.defineProperty(nt,"__esModule",{value:!0});nt.decode=nt.encode=void 0;var Si=["|","<",">","?",":"],Zs=Si.map(s=>String.fromCodePoint(61440+Number(s.codePointAt(0)))),th=new Map(Si.map((s,e)=>[s,Zs[e]])),ih=new Map(Zs.map((s,e)=>[s,Si[e]])),sh=s=>Si.reduce((e,t)=>e.split(t).join(th.get(t)),s);nt.encode=sh;var rh=s=>Zs.reduce((e,t)=>e.split(t).join(ih.get(t)),s);nt.decode=rh});var sr=d(M=>{"use strict";var nh=M&&M.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),oh=M&&M.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),ah=M&&M.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&nh(t,e,i[r]);return oh(t,e),t}})(),cn=M&&M.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(M,"__esModule",{value:!0});M.WriteEntryTar=M.WriteEntrySync=M.WriteEntry=void 0;var oe=cn(__nccwpck_require__(9896)),fn=We(),on=cn(__nccwpck_require__(6928)),dn=et(),mn=rn(),ne=tt(),pn=Xt(),_n=ii(),wn=Hs(),hh=wi(),yn=ai(),lh=ah(Gs()),En=(s,e)=>e?(s=(0,ne.normalizeWindowsPath)(s).replace(/^\.(\/|$)/,""),(0,hh.stripTrailingSlashes)(e)+"/"+s):(0,ne.normalizeWindowsPath)(s),uh=16*1024*1024,an=Symbol("process"),hn=Symbol("file"),ln=Symbol("directory"),Ks=Symbol("symlink"),un=Symbol("hardlink"),Rt=Symbol("header"),gi=Symbol("read"),Vs=Symbol("lstat"),Oi=Symbol("onlstat"),$s=Symbol("onread"),Xs=Symbol("onreadlink"),Qs=Symbol("openfile"),Js=Symbol("onopenfile"),ve=Symbol("close"),Ri=Symbol("mode"),er=Symbol("awaitDrain"),Ys=Symbol("ondrain"),ae=Symbol("prefix"),vi=class extends fn.Minipass{path;portable;myuid=process.getuid&&process.getuid()||0;myuser=process.env.USER||"";maxReadSize;linkCache;statCache;preservePaths;cwd;strict;mtime;noPax;noMtime;prefix;fd;blockLen=0;blockRemain=0;buf;pos=0;remain=0;length=0;offset=0;win32;absolute;header;type;linkpath;stat;onWriteEntry;#e=!1;constructor(e,t={}){let i=(0,pn.dealias)(t);super(),this.path=(0,ne.normalizeWindowsPath)(e),this.portable=!!i.portable,this.maxReadSize=i.maxReadSize||uh,this.linkCache=i.linkCache||new Map,this.statCache=i.statCache||new Map,this.preservePaths=!!i.preservePaths,this.cwd=(0,ne.normalizeWindowsPath)(i.cwd||process.cwd()),this.strict=!!i.strict,this.noPax=!!i.noPax,this.noMtime=!!i.noMtime,this.mtime=i.mtime,this.prefix=i.prefix?(0,ne.normalizeWindowsPath)(i.prefix):void 0,this.onWriteEntry=i.onWriteEntry,typeof i.onwarn=="function"&&this.on("warn",i.onwarn);let r=!1;if(!this.preservePaths){let[o,h]=(0,wn.stripAbsolutePath)(this.path);o&&typeof h=="string"&&(this.path=h,r=o)}this.win32=!!i.win32||process.platform==="win32",this.win32&&(this.path=lh.decode(this.path.replaceAll(/\\/g,"/")),e=e.replaceAll(/\\/g,"/")),this.absolute=(0,ne.normalizeWindowsPath)(i.absolute||on.default.resolve(this.cwd,e)),this.path===""&&(this.path="./"),r&&this.warn("TAR_ENTRY_INFO",`stripping ${r} from absolute path`,{entry:this,path:r+this.path});let n=this.statCache.get(this.absolute);n?this[Oi](n):this[Vs]()}warn(e,t,i={}){return(0,yn.warnMethod)(this,e,t,i)}emit(e,...t){return e==="error"&&(this.#e=!0),super.emit(e,...t)}[Vs](){oe.default.lstat(this.absolute,(e,t)=>{if(e)return this.emit("error",e);this[Oi](t)})}[Oi](e){this.statCache.set(this.absolute,e),this.stat=e,e.isFile()||(e.size=0),this.type=ch(e),this.emit("stat",e),this[an]()}[an](){switch(this.type){case"File":return this[hn]();case"Directory":return this[ln]();case"SymbolicLink":return this[Ks]();default:return this.end()}}[Ri](e){return(0,mn.modeFix)(e,this.type==="Directory",this.portable)}[ae](e){return En(e,this.prefix)}[Rt](){if(!this.stat)throw new Error("cannot write header before stat");this.type==="Directory"&&this.portable&&(this.noMtime=!0),this.onWriteEntry?.(this),this.header=new dn.Header({path:this[ae](this.path),linkpath:this.type==="Link"&&this.linkpath!==void 0?this[ae](this.linkpath):this.linkpath,mode:this[Ri](this.stat.mode),uid:this.portable?void 0:this.stat.uid,gid:this.portable?void 0:this.stat.gid,size:this.stat.size,mtime:this.noMtime?void 0:this.mtime||this.stat.mtime,type:this.type==="Unsupported"?void 0:this.type,uname:this.portable?void 0:this.stat.uid===this.myuid?this.myuser:"",atime:this.portable?void 0:this.stat.atime,ctime:this.portable?void 0:this.stat.ctime}),this.header.encode()&&!this.noPax&&super.write(new _n.Pax({atime:this.portable?void 0:this.header.atime,ctime:this.portable?void 0:this.header.ctime,gid:this.portable?void 0:this.header.gid,mtime:this.noMtime?void 0:this.mtime||this.header.mtime,path:this[ae](this.path),linkpath:this.type==="Link"&&this.linkpath!==void 0?this[ae](this.linkpath):this.linkpath,size:this.header.size,uid:this.portable?void 0:this.header.uid,uname:this.portable?void 0:this.header.uname,dev:this.portable?void 0:this.stat.dev,ino:this.portable?void 0:this.stat.ino,nlink:this.portable?void 0:this.stat.nlink}).encode());let e=this.header?.block;if(!e)throw new Error("failed to encode header");super.write(e)}[ln](){if(!this.stat)throw new Error("cannot create directory entry without stat");this.path.slice(-1)!=="/"&&(this.path+="/"),this.stat.size=0,this[Rt](),this.end()}[Ks](){oe.default.readlink(this.absolute,(e,t)=>{if(e)return this.emit("error",e);this[Xs](t)})}[Xs](e){this.linkpath=(0,ne.normalizeWindowsPath)(e),this[Rt](),this.end()}[un](e){if(!this.stat)throw new Error("cannot create link entry without stat");this.type="Link",this.linkpath=(0,ne.normalizeWindowsPath)(on.default.relative(this.cwd,e)),this.stat.size=0,this[Rt](),this.end()}[hn](){if(!this.stat)throw new Error("cannot create file entry without stat");if(this.stat.nlink>1){let e=`${this.stat.dev}:${this.stat.ino}`,t=this.linkCache.get(e);if(t?.indexOf(this.cwd)===0)return this[un](t);this.linkCache.set(e,this.absolute)}if(this[Rt](),this.stat.size===0)return this.end();this[Qs]()}[Qs](){oe.default.open(this.absolute,"r",(e,t)=>{if(e)return this.emit("error",e);this[Js](t)})}[Js](e){if(this.fd=e,this.#e)return this[ve]();if(!this.stat)throw new Error("should stat before calling onopenfile");this.blockLen=512*Math.ceil(this.stat.size/512),this.blockRemain=this.blockLen;let t=Math.min(this.blockLen,this.maxReadSize);this.buf=Buffer.allocUnsafe(t),this.offset=0,this.pos=0,this.remain=this.stat.size,this.length=this.buf.length,this[gi]()}[gi](){let{fd:e,buf:t,offset:i,length:r,pos:n}=this;if(e===void 0||t===void 0)throw new Error("cannot read file without first opening");oe.default.read(e,t,i,r,n,(o,h)=>{if(o)return this[ve](()=>this.emit("error",o));this[$s](h)})}[ve](e=()=>{}){this.fd!==void 0&&oe.default.close(this.fd,e)}[$s](e){if(e<=0&&this.remain>0){let r=Object.assign(new Error("encountered unexpected EOF"),{path:this.absolute,syscall:"read",code:"EOF"});return this[ve](()=>this.emit("error",r))}if(e>this.remain){let r=Object.assign(new Error("did not encounter expected EOF"),{path:this.absolute,syscall:"read",code:"EOF"});return this[ve](()=>this.emit("error",r))}if(!this.buf)throw new Error("should have created buffer prior to reading");if(e===this.remain)for(let r=e;r<this.length&&e<this.blockRemain;r++)this.buf[r+this.offset]=0,e++,this.remain++;let t=this.offset===0&&e===this.buf.length?this.buf:this.buf.subarray(this.offset,this.offset+e);this.write(t)?this[Ys]():this[er](()=>this[Ys]())}[er](e){this.once("drain",e)}write(e,t,i){if(typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,typeof t=="string"?t:"utf8")),this.blockRemain<e.length){let r=Object.assign(new Error("writing more data than expected"),{path:this.absolute});return this.emit("error",r)}return this.remain-=e.length,this.blockRemain-=e.length,this.pos+=e.length,this.offset+=e.length,super.write(e,null,i)}[Ys](){if(!this.remain)return this.blockRemain&&super.write(Buffer.alloc(this.blockRemain)),this[ve](e=>e?this.emit("error",e):this.end());if(!this.buf)throw new Error("buffer lost somehow in ONDRAIN");this.offset>=this.length&&(this.buf=Buffer.allocUnsafe(Math.min(this.blockRemain,this.buf.length)),this.offset=0),this.length=this.buf.length-this.offset,this[gi]()}};M.WriteEntry=vi;var tr=class extends vi{sync=!0;[Vs](){this[Oi](oe.default.lstatSync(this.absolute))}[Ks](){this[Xs](oe.default.readlinkSync(this.absolute))}[Qs](){this[Js](oe.default.openSync(this.absolute,"r"))}[gi](){let e=!0;try{let{fd:t,buf:i,offset:r,length:n,pos:o}=this;if(t===void 0||i===void 0)throw new Error("fd and buf must be set in READ method");let h=oe.default.readSync(t,i,r,n,o);this[$s](h),e=!1}finally{if(e)try{this[ve](()=>{})}catch{}}}[er](e){e()}[ve](e=()=>{}){this.fd!==void 0&&oe.default.closeSync(this.fd),e()}};M.WriteEntrySync=tr;var ir=class extends fn.Minipass{blockLen=0;blockRemain=0;buf=0;pos=0;remain=0;length=0;preservePaths;portable;strict;noPax;noMtime;readEntry;type;prefix;path;mode;uid;gid;uname;gname;header;mtime;atime;ctime;linkpath;size;onWriteEntry;warn(e,t,i={}){return(0,yn.warnMethod)(this,e,t,i)}constructor(e,t={}){let i=(0,pn.dealias)(t);super(),this.preservePaths=!!i.preservePaths,this.portable=!!i.portable,this.strict=!!i.strict,this.noPax=!!i.noPax,this.noMtime=!!i.noMtime,this.onWriteEntry=i.onWriteEntry,this.readEntry=e;let{type:r}=e;if(r==="Unsupported")throw new Error("writing entry that should be ignored");this.type=r,this.type==="Directory"&&this.portable&&(this.noMtime=!0),this.prefix=i.prefix,this.path=(0,ne.normalizeWindowsPath)(e.path),this.mode=e.mode!==void 0?this[Ri](e.mode):void 0,this.uid=this.portable?void 0:e.uid,this.gid=this.portable?void 0:e.gid,this.uname=this.portable?void 0:e.uname,this.gname=this.portable?void 0:e.gname,this.size=e.size,this.mtime=this.noMtime?void 0:i.mtime||e.mtime,this.atime=this.portable?void 0:e.atime,this.ctime=this.portable?void 0:e.ctime,this.linkpath=e.linkpath!==void 0?(0,ne.normalizeWindowsPath)(e.linkpath):void 0,typeof i.onwarn=="function"&&this.on("warn",i.onwarn);let n=!1;if(!this.preservePaths){let[h,a]=(0,wn.stripAbsolutePath)(this.path);h&&typeof a=="string"&&(this.path=a,n=h)}this.remain=e.size,this.blockRemain=e.startBlockSize,this.onWriteEntry?.(this),this.header=new dn.Header({path:this[ae](this.path),linkpath:this.type==="Link"&&this.linkpath!==void 0?this[ae](this.linkpath):this.linkpath,mode:this.mode,uid:this.portable?void 0:this.uid,gid:this.portable?void 0:this.gid,size:this.size,mtime:this.noMtime?void 0:this.mtime,type:this.type,uname:this.portable?void 0:this.uname,atime:this.portable?void 0:this.atime,ctime:this.portable?void 0:this.ctime}),n&&this.warn("TAR_ENTRY_INFO",`stripping ${n} from absolute path`,{entry:this,path:n+this.path}),this.header.encode()&&!this.noPax&&super.write(new _n.Pax({atime:this.portable?void 0:this.atime,ctime:this.portable?void 0:this.ctime,gid:this.portable?void 0:this.gid,mtime:this.noMtime?void 0:this.mtime,path:this[ae](this.path),linkpath:this.type==="Link"&&this.linkpath!==void 0?this[ae](this.linkpath):this.linkpath,size:this.size,uid:this.portable?void 0:this.uid,uname:this.portable?void 0:this.uname,dev:this.portable?void 0:this.readEntry.dev,ino:this.portable?void 0:this.readEntry.ino,nlink:this.portable?void 0:this.readEntry.nlink}).encode());let o=this.header?.block;if(!o)throw new Error("failed to encode header");super.write(o),e.pipe(this)}[ae](e){return En(e,this.prefix)}[Ri](e){return(0,mn.modeFix)(e,this.type==="Directory",this.portable)}write(e,t,i){typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,typeof t=="string"?t:"utf8"));let r=e.length;if(r>this.blockRemain)throw new Error("writing more to entry than is appropriate");return this.blockRemain-=r,super.write(e,i)}end(e,t,i){return this.blockRemain&&super.write(Buffer.alloc(this.blockRemain)),typeof e=="function"&&(i=e,t=void 0,e=void 0),typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,t??"utf8")),i&&this.once("finish",i),e?super.end(e,i):super.end(i),this}};M.WriteEntryTar=ir;var ch=s=>s.isFile()?"File":s.isDirectory()?"Directory":s.isSymbolicLink()?"SymbolicLink":"Unsupported"});var bn=d(at=>{"use strict";Object.defineProperty(at,"__esModule",{value:!0});at.Node=at.Yallist=void 0;var rr=class s{tail;head;length=0;static create(e=[]){return new s(e)}constructor(e=[]){for(let t of e)this.push(t)}*[Symbol.iterator](){for(let e=this.head;e;e=e.next)yield e.value}removeNode(e){if(e.list!==this)throw new Error("removing node which does not belong to this list");let t=e.next,i=e.prev;return t&&(t.prev=i),i&&(i.next=t),e===this.head&&(this.head=t),e===this.tail&&(this.tail=i),this.length--,e.next=void 0,e.prev=void 0,e.list=void 0,t}unshiftNode(e){if(e===this.head)return;e.list&&e.list.removeNode(e);let t=this.head;e.list=this,e.next=t,t&&(t.prev=e),this.head=e,this.tail||(this.tail=e),this.length++}pushNode(e){if(e===this.tail)return;e.list&&e.list.removeNode(e);let t=this.tail;e.list=this,e.prev=t,t&&(t.next=e),this.tail=e,this.head||(this.head=e),this.length++}push(...e){for(let t=0,i=e.length;t<i;t++)dh(this,e[t]);return this.length}unshift(...e){for(var t=0,i=e.length;t<i;t++)mh(this,e[t]);return this.length}pop(){if(!this.tail)return;let e=this.tail.value,t=this.tail;return this.tail=this.tail.prev,this.tail?this.tail.next=void 0:this.head=void 0,t.list=void 0,this.length--,e}shift(){if(!this.head)return;let e=this.head.value,t=this.head;return this.head=this.head.next,this.head?this.head.prev=void 0:this.tail=void 0,t.list=void 0,this.length--,e}forEach(e,t){t=t||this;for(let i=this.head,r=0;i;r++)e.call(t,i.value,r,this),i=i.next}forEachReverse(e,t){t=t||this;for(let i=this.tail,r=this.length-1;i;r--)e.call(t,i.value,r,this),i=i.prev}get(e){let t=0,i=this.head;for(;i&&t<e;t++)i=i.next;if(t===e&&i)return i.value}getReverse(e){let t=0,i=this.tail;for(;i&&t<e;t++)i=i.prev;if(t===e&&i)return i.value}map(e,t){t=t||this;let i=new s;for(let r=this.head;r;)i.push(e.call(t,r.value,this)),r=r.next;return i}mapReverse(e,t){t=t||this;var i=new s;for(let r=this.tail;r;)i.push(e.call(t,r.value,this)),r=r.prev;return i}reduce(e,t){let i,r=this.head;if(arguments.length>1)i=t;else if(this.head)r=this.head.next,i=this.head.value;else throw new TypeError("Reduce of empty list with no initial value");for(var n=0;r;n++)i=e(i,r.value,n),r=r.next;return i}reduceReverse(e,t){let i,r=this.tail;if(arguments.length>1)i=t;else if(this.tail)r=this.tail.prev,i=this.tail.value;else throw new TypeError("Reduce of empty list with no initial value");for(let n=this.length-1;r;n--)i=e(i,r.value,n),r=r.prev;return i}toArray(){let e=new Array(this.length);for(let t=0,i=this.head;i;t++)e[t]=i.value,i=i.next;return e}toArrayReverse(){let e=new Array(this.length);for(let t=0,i=this.tail;i;t++)e[t]=i.value,i=i.prev;return e}slice(e=0,t=this.length){t<0&&(t+=this.length),e<0&&(e+=this.length);let i=new s;if(t<e||t<0)return i;e<0&&(e=0),t>this.length&&(t=this.length);let r=this.head,n=0;for(n=0;r&&n<e;n++)r=r.next;for(;r&&n<t;n++,r=r.next)i.push(r.value);return i}sliceReverse(e=0,t=this.length){t<0&&(t+=this.length),e<0&&(e+=this.length);let i=new s;if(t<e||t<0)return i;e<0&&(e=0),t>this.length&&(t=this.length);let r=this.length,n=this.tail;for(;n&&r>t;r--)n=n.prev;for(;n&&r>e;r--,n=n.prev)i.push(n.value);return i}splice(e,t=0,...i){e>this.length&&(e=this.length-1),e<0&&(e=this.length+e);let r=this.head;for(let o=0;r&&o<e;o++)r=r.next;let n=[];for(let o=0;r&&o<t;o++)n.push(r.value),r=this.removeNode(r);r?r!==this.tail&&(r=r.prev):r=this.tail;for(let o of i)r=fh(this,r,o);return n}reverse(){let e=this.head,t=this.tail;for(let i=e;i;i=i.prev){let r=i.prev;i.prev=i.next,i.next=r}return this.head=t,this.tail=e,this}};at.Yallist=rr;function fh(s,e,t){let i=e,r=e?e.next:s.head,n=new ot(t,i,r,s);return n.next===void 0&&(s.tail=n),n.prev===void 0&&(s.head=n),s.length++,n}function dh(s,e){s.tail=new ot(e,s.tail,void 0,s),s.head||(s.head=s.tail),s.length++}function mh(s,e){s.head=new ot(e,void 0,s.head,s),s.tail||(s.tail=s.head),s.length++}var ot=class{list;next;prev;value;constructor(e,t,i,r){this.list=r,this.value=e,t?(t.next=this,this.prev=t):this.prev=void 0,i?(i.prev=this,this.next=i):this.next=void 0}};at.Node=ot});var Fi=d(L=>{"use strict";var ph=L&&L.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),_h=L&&L.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),wh=L&&L.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&ph(t,e,i[r]);return _h(t,e),t}})(),vn=L&&L.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(L,"__esModule",{value:!0});L.PackSync=L.Pack=L.PackJob=void 0;var Ai=vn(__nccwpck_require__(9896)),ur=sr(),Pt=class{path;absolute;entry;stat;readdir;pending=!1;pendingLink=!1;ignore=!1;piped=!1;constructor(e,t){this.path=e||"./",this.absolute=t}};L.PackJob=Pt;var yh=We(),nr=wh(Ds()),Eh=bn(),bh=ai(),Sn=Buffer.alloc(1024),Di=Symbol("onStat"),vt=Symbol("ended"),X=Symbol("queue"),Tt=Symbol("pendingLinks"),Te=Symbol("current"),je=Symbol("process"),Dt=Symbol("processing"),Ti=Symbol("processJob"),Q=Symbol("jobs"),or=Symbol("jobDone"),Pi=Symbol("addFSEntry"),gn=Symbol("addTarEntry"),cr=Symbol("stat"),fr=Symbol("readdir"),Ni=Symbol("onreaddir"),Mi=Symbol("pipe"),On=Symbol("entry"),ar=Symbol("entryOpt"),Li=Symbol("writeEntryClass"),Tn=Symbol("write"),hr=Symbol("ondrain"),Rn=vn(__nccwpck_require__(6928)),lr=tt(),Ii=class extends yh.Minipass{sync=!1;opt;cwd;maxReadSize;preservePaths;strict;noPax;prefix;linkCache;statCache;file;portable;zip;readdirCache;noDirRecurse;follow;noMtime;mtime;filter;jobs;[Li];onWriteEntry;[X];[Tt]=new Map;[Q]=0;[Dt]=!1;[vt]=!1;constructor(e={}){if(super(),this.opt=e,this.file=e.file||"",this.cwd=e.cwd||process.cwd(),this.maxReadSize=e.maxReadSize,this.preservePaths=!!e.preservePaths,this.strict=!!e.strict,this.noPax=!!e.noPax,this.prefix=(0,lr.normalizeWindowsPath)(e.prefix||""),this.linkCache=e.linkCache||new Map,this.statCache=e.statCache||new Map,this.readdirCache=e.readdirCache||new Map,this.onWriteEntry=e.onWriteEntry,this[Li]=ur.WriteEntry,typeof e.onwarn=="function"&&this.on("warn",e.onwarn),this.portable=!!e.portable,e.gzip||e.brotli||e.zstd){if((e.gzip?1:0)+(e.brotli?1:0)+(e.zstd?1:0)>1)throw new TypeError("gzip, brotli, zstd are mutually exclusive");if(e.gzip&&(typeof e.gzip!="object"&&(e.gzip={}),this.portable&&(e.gzip.portable=!0),this.zip=new nr.Gzip(e.gzip)),e.brotli&&(typeof e.brotli!="object"&&(e.brotli={}),this.zip=new nr.BrotliCompress(e.brotli)),e.zstd&&(typeof e.zstd!="object"&&(e.zstd={}),this.zip=new nr.ZstdCompress(e.zstd)),!this.zip)throw new Error("impossible");let t=this.zip;t.on("data",i=>super.write(i)),t.on("end",()=>super.end()),t.on("drain",()=>this[hr]()),this.on("resume",()=>t.resume())}else this.on("drain",this[hr]);this.noDirRecurse=!!e.noDirRecurse,this.follow=!!e.follow,this.noMtime=!!e.noMtime,e.mtime&&(this.mtime=e.mtime),this.filter=typeof e.filter=="function"?e.filter:()=>!0,this[X]=new Eh.Yallist,this[Q]=0,this.jobs=Number(e.jobs)||4,this[Dt]=!1,this[vt]=!1}[Tn](e){return super.write(e)}add(e){return this.write(e),this}end(e,t,i){return typeof e=="function"&&(i=e,e=void 0),typeof t=="function"&&(i=t,t=void 0),e&&this.add(e),this[vt]=!0,this[je](),i&&i(),this}write(e){if(this[vt])throw new Error("write after end");return typeof e=="string"?this[Pi](e):this[gn](e),this.flowing}[gn](e){let t=(0,lr.normalizeWindowsPath)(Rn.default.resolve(this.cwd,e.path));if(!this.filter(e.path,e))e.resume();else{let i=new Pt(e.path,t);i.entry=new ur.WriteEntryTar(e,this[ar](i)),i.entry.on("end",()=>this[or](i)),this[Q]+=1,this[X].push(i)}this[je]()}[Pi](e){let t=(0,lr.normalizeWindowsPath)(Rn.default.resolve(this.cwd,e));this[X].push(new Pt(e,t)),this[je]()}[cr](e){e.pending=!0,this[Q]+=1;let t=this.follow?"stat":"lstat";Ai.default[t](e.absolute,(i,r)=>{e.pending=!1,this[Q]-=1,i?this.emit("error",i):this[Di](e,r)})}[Di](e,t){if(this.statCache.set(e.absolute,t),e.stat=t,!this.filter(e.path,t))e.ignore=!0;else if(t.isFile()&&t.nlink>1&&!this.linkCache.get(`${t.dev}:${t.ino}`)&&!this.sync)if(e===this[Te])this[Ti](e);else{let i=`${t.dev}:${t.ino}`,r=this[Tt].get(i);r?r.push(e):this[Tt].set(i,[e]),e.pendingLink=!0,e.pending=!0}this[je]()}[fr](e){e.pending=!0,this[Q]+=1,Ai.default.readdir(e.absolute,(t,i)=>{if(e.pending=!1,this[Q]-=1,t)return this.emit("error",t);this[Ni](e,i)})}[Ni](e,t){this.readdirCache.set(e.absolute,t),e.readdir=t,this[je]()}[je](){if(!this[Dt]){this[Dt]=!0;for(let e=this[X].head;e&&this[Q]<this.jobs;e=e.next)if(this[Ti](e.value),e.value.ignore){let t=e.next;this[X].removeNode(e),e.next=t}this[Dt]=!1,this[vt]&&this[X].length===0&&this[Q]===0&&(this.zip?this.zip.end(Sn):(super.write(Sn),super.end()))}}get[Te](){return this[X]&&this[X].head&&this[X].head.value}[or](e){this[X].shift(),this[Q]-=1;let{stat:t}=e;if(t&&t.isFile()&&t.nlink>1){let i=`${t.dev}:${t.ino}`,r=this[Tt].get(i);if(r){this[Tt].delete(i);for(let n of r)n.pending=!1,this[Ti](n)}}this[je]()}[Ti](e){if(e.pending&&e.pendingLink&&e===this[Te]&&(e.pending=!1,e.pendingLink=!1),!e.pending){if(e.entry){e===this[Te]&&!e.piped&&this[Mi](e);return}if(!e.stat){let t=this.statCache.get(e.absolute);t?this[Di](e,t):this[cr](e)}if(e.stat&&!e.ignore){if(!this.noDirRecurse&&e.stat.isDirectory()&&!e.readdir){let t=this.readdirCache.get(e.absolute);if(t?this[Ni](e,t):this[fr](e),!e.readdir)return}if(e.entry=this[On](e),!e.entry){e.ignore=!0;return}e===this[Te]&&!e.piped&&this[Mi](e)}}}[ar](e){return{onwarn:(t,i,r)=>this.warn(t,i,r),noPax:this.noPax,cwd:this.cwd,absolute:e.absolute,preservePaths:this.preservePaths,maxReadSize:this.maxReadSize,strict:this.strict,portable:this.portable,linkCache:this.linkCache,statCache:this.statCache,noMtime:this.noMtime,mtime:this.mtime,prefix:this.prefix,onWriteEntry:this.onWriteEntry}}[On](e){this[Q]+=1;try{return new this[Li](e.path,this[ar](e)).on("end",()=>this[or](e)).on("error",i=>this.emit("error",i))}catch(t){this.emit("error",t)}}[hr](){this[Te]&&this[Te].entry&&this[Te].entry.resume()}[Mi](e){e.piped=!0,e.readdir&&e.readdir.forEach(r=>{let n=e.path,o=n==="./"?"":n.replace(/\/*$/,"/");this[Pi](o+r)});let t=e.entry,i=this.zip;if(!t)throw new Error("cannot pipe without source");i?t.on("data",r=>{i.write(r)||t.pause()}):t.on("data",r=>{super.write(r)||t.pause()})}pause(){return this.zip&&this.zip.pause(),super.pause()}warn(e,t,i={}){(0,bh.warnMethod)(this,e,t,i)}};L.Pack=Ii;var dr=class extends Ii{sync=!0;constructor(e){super(e),this[Li]=ur.WriteEntrySync}pause(){}resume(){}[cr](e){let t=this.follow?"statSync":"lstatSync";this[Di](e,Ai.default[t](e.absolute))}[fr](e){this[Ni](e,Ai.default.readdirSync(e.absolute))}[Mi](e){let t=e.entry,i=this.zip;if(e.readdir&&e.readdir.forEach(r=>{let n=e.path,o=n==="./"?"":n.replace(/\/*$/,"/");this[Pi](o+r)}),!t)throw new Error("Cannot pipe without source");i?t.on("data",r=>{i.write(r)}):t.on("data",r=>{super[Tn](r)})}};L.PackSync=dr});var mr=d(ht=>{"use strict";var Sh=ht&&ht.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(ht,"__esModule",{value:!0});ht.create=void 0;var Dn=Ke(),Pn=Sh(__nccwpck_require__(6760)),Nn=rt(),gh=Ve(),Ci=Fi(),Oh=(s,e)=>{let t=new Ci.PackSync(s),i=new Dn.WriteStreamSync(s.file,{mode:s.mode||438});t.pipe(i),Mn(t,e)},Rh=(s,e)=>{let t=new Ci.Pack(s),i=new Dn.WriteStream(s.file,{mode:s.mode||438});t.pipe(i);let r=new Promise((n,o)=>{i.on("error",o),i.on("close",n),t.on("error",o)});return Ln(t,e).catch(n=>t.emit("error",n)),r},Mn=(s,e)=>{e.forEach(t=>{t.charAt(0)==="@"?(0,Nn.list)({file:Pn.default.resolve(s.cwd,t.slice(1)),sync:!0,noResume:!0,onReadEntry:i=>s.add(i)}):s.add(t)}),s.end()},Ln=async(s,e)=>{for(let t of e)t.charAt(0)==="@"?await(0,Nn.list)({file:Pn.default.resolve(String(s.cwd),t.slice(1)),noResume:!0,onReadEntry:i=>{s.add(i)}}):s.add(t);s.end()},vh=(s,e)=>{let t=new Ci.PackSync(s);return Mn(t,e),t},Th=(s,e)=>{let t=new Ci.Pack(s);return Ln(t,e).catch(i=>t.emit("error",i)),t};ht.create=(0,gh.makeCommand)(Oh,Rh,vh,Th,(s,e)=>{if(!e?.length)throw new TypeError("no paths specified to add to archive")})});var jn=d(lt=>{"use strict";var Dh=lt&&lt.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(lt,"__esModule",{value:!0});lt.getWriteFlag=void 0;var Fn=Dh(__nccwpck_require__(9896)),Ph=process.env.__FAKE_PLATFORM__||process.platform,Cn=Ph==="win32",{O_CREAT:Bn,O_NOFOLLOW:An,O_TRUNC:zn,O_WRONLY:kn}=Fn.default.constants,xn=Number(process.env.__FAKE_FS_O_FILENAME__)||Fn.default.constants.UV_FS_O_FILEMAP||0,Nh=Cn&&!!xn,Mh=512*1024,Lh=xn|zn|Bn|kn,In=!Cn&&typeof An=="number"?An|zn|Bn|kn:null;lt.getWriteFlag=In!==null?()=>In:Nh?s=>s<Mh?Lh:"w":()=>"w"});var qn=d(he=>{"use strict";var Un=he&&he.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(he,"__esModule",{value:!0});he.chownrSync=he.chownr=void 0;var zi=Un(__nccwpck_require__(3024)),Nt=Un(__nccwpck_require__(6760)),pr=(s,e,t)=>{try{return zi.default.lchownSync(s,e,t)}catch(i){if(i?.code!=="ENOENT")throw i}},Bi=(s,e,t,i)=>{zi.default.lchown(s,e,t,r=>{i(r&&r?.code!=="ENOENT"?r:null)})},Ah=(s,e,t,i,r)=>{if(e.isDirectory())(0,he.chownr)(Nt.default.resolve(s,e.name),t,i,n=>{if(n)return r(n);let o=Nt.default.resolve(s,e.name);Bi(o,t,i,r)});else{let n=Nt.default.resolve(s,e.name);Bi(n,t,i,r)}},Ih=(s,e,t,i)=>{zi.default.readdir(s,{withFileTypes:!0},(r,n)=>{if(r){if(r.code==="ENOENT")return i();if(r.code!=="ENOTDIR"&&r.code!=="ENOTSUP")return i(r)}if(r||!n.length)return Bi(s,e,t,i);let o=n.length,h=null,a=l=>{if(!h){if(l)return i(h=l);if(--o===0)return Bi(s,e,t,i)}};for(let l of n)Ah(s,l,e,t,a)})};he.chownr=Ih;var Fh=(s,e,t,i)=>{e.isDirectory()&&(0,he.chownrSync)(Nt.default.resolve(s,e.name),t,i),pr(Nt.default.resolve(s,e.name),t,i)},Ch=(s,e,t)=>{let i;try{i=zi.default.readdirSync(s,{withFileTypes:!0})}catch(r){let n=r;if(n?.code==="ENOENT")return;if(n?.code==="ENOTDIR"||n?.code==="ENOTSUP")return pr(s,e,t);throw n}for(let r of i)Fh(s,r,e,t);return pr(s,e,t)};he.chownrSync=Ch});var Wn=d(ki=>{"use strict";Object.defineProperty(ki,"__esModule",{value:!0});ki.CwdError=void 0;var _r=class extends Error{path;code;syscall="chdir";constructor(e,t){super(`${t}: Cannot cd into '${e}'`),this.path=e,this.code=t}get name(){return"CwdError"}};ki.CwdError=_r});var yr=d(xi=>{"use strict";Object.defineProperty(xi,"__esModule",{value:!0});xi.SymlinkError=void 0;var wr=class extends Error{path;symlink;syscall="symlink";code="TAR_SYMLINK_ERROR";constructor(e,t){super("TAR_SYMLINK_ERROR: Cannot extract through symbolic link"),this.symlink=e,this.path=t}get name(){return"SymlinkError"}};xi.SymlinkError=wr});var Kn=d(De=>{"use strict";var br=De&&De.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(De,"__esModule",{value:!0});De.mkdirSync=De.mkdir=void 0;var Hn=qn(),j=br(__nccwpck_require__(3024)),Bh=br(__nccwpck_require__(1455)),ji=br(__nccwpck_require__(6760)),Zn=Wn(),pe=tt(),Gn=yr(),zh=(s,e)=>{j.default.stat(s,(t,i)=>{(t||!i.isDirectory())&&(t=new Zn.CwdError(s,t?.code||"ENOTDIR")),e(t)})},kh=(s,e,t)=>{s=(0,pe.normalizeWindowsPath)(s);let i=e.umask??18,r=e.mode|448,n=(r&i)!==0,o=e.uid,h=e.gid,a=typeof o=="number"&&typeof h=="number"&&(o!==e.processUid||h!==e.processGid),l=e.preserve,u=e.unlink,c=(0,pe.normalizeWindowsPath)(e.cwd),E=(w,P)=>{w?t(w):P&&a?(0,Hn.chownr)(P,o,h,kt=>E(kt)):n?j.default.chmod(s,r,t):t()};if(s===c)return zh(s,E);if(l)return Bh.default.mkdir(s,{mode:r,recursive:!0}).then(w=>E(null,w??void 0),E);let A=(0,pe.normalizeWindowsPath)(ji.default.relative(c,s)).split("/");Er(c,A,r,u,c,void 0,E)};De.mkdir=kh;var Er=(s,e,t,i,r,n,o)=>{if(e.length===0)return o(null,n);let h=e.shift(),a=(0,pe.normalizeWindowsPath)(ji.default.resolve(s+"/"+h));j.default.mkdir(a,t,Yn(a,e,t,i,r,n,o))},Yn=(s,e,t,i,r,n,o)=>h=>{h?j.default.lstat(s,(a,l)=>{if(a)a.path=a.path&&(0,pe.normalizeWindowsPath)(a.path),o(a);else if(l.isDirectory())Er(s,e,t,i,r,n,o);else if(i)j.default.unlink(s,u=>{if(u)return o(u);j.default.mkdir(s,t,Yn(s,e,t,i,r,n,o))});else{if(l.isSymbolicLink())return o(new Gn.SymlinkError(s,s+"/"+e.join("/")));o(h)}}):(n=n||s,Er(s,e,t,i,r,n,o))},xh=s=>{let e=!1,t;try{e=j.default.statSync(s).isDirectory()}catch(i){t=i?.code}finally{if(!e)throw new Zn.CwdError(s,t??"ENOTDIR")}},jh=(s,e)=>{s=(0,pe.normalizeWindowsPath)(s);let t=e.umask??18,i=e.mode|448,r=(i&t)!==0,n=e.uid,o=e.gid,h=typeof n=="number"&&typeof o=="number"&&(n!==e.processUid||o!==e.processGid),a=e.preserve,l=e.unlink,u=(0,pe.normalizeWindowsPath)(e.cwd),c=w=>{w&&h&&(0,Hn.chownrSync)(w,n,o),r&&j.default.chmodSync(s,i)};if(s===u)return xh(u),c();if(a)return c(j.default.mkdirSync(s,{mode:i,recursive:!0})??void 0);let D=(0,pe.normalizeWindowsPath)(ji.default.relative(u,s)).split("/"),A;for(let w=D.shift(),P=u;w&&(P+="/"+w);w=D.shift()){P=(0,pe.normalizeWindowsPath)(ji.default.resolve(P));try{j.default.mkdirSync(P,i),A=A||P}catch{let kt=j.default.lstatSync(P);if(kt.isDirectory())continue;if(l){j.default.unlinkSync(P),j.default.mkdirSync(P,i),A=A||P;continue}else if(kt.isSymbolicLink())return new Gn.SymlinkError(P,P+"/"+D.join("/"))}}return c(A)};De.mkdirSync=jh});var $n=d(Ui=>{"use strict";Object.defineProperty(Ui,"__esModule",{value:!0});Ui.normalizeUnicode=void 0;var Sr=Object.create(null),Vn=1e4,ut=new Set,Uh=s=>{ut.has(s)?ut.delete(s):Sr[s]=s.normalize("NFD").toLocaleLowerCase("en").toLocaleUpperCase("en"),ut.add(s);let e=Sr[s],t=ut.size-Vn;if(t>Vn/10){for(let i of ut)if(ut.delete(i),delete Sr[i],--t<=0)break}return e};Ui.normalizeUnicode=Uh});var Qn=d(qi=>{"use strict";Object.defineProperty(qi,"__esModule",{value:!0});qi.PathReservations=void 0;var Xn=__nccwpck_require__(6760),qh=$n(),Wh=wi(),Hh=process.env.TESTING_TAR_FAKE_PLATFORM||process.platform,Zh=Hh==="win32",Gh=s=>s.split("/").slice(0,-1).reduce((t,i)=>{let r=t.at(-1);return r!==void 0&&(i=(0,Xn.join)(r,i)),t.push(i||"/"),t},[]),gr=class{#e=new Map;#i=new Map;#s=new Set;reserve(e,t){e=Zh?["win32 parallelization disabled"]:e.map(r=>(0,Wh.stripTrailingSlashes)((0,Xn.join)((0,qh.normalizeUnicode)(r))));let i=new Set(e.map(r=>Gh(r)).reduce((r,n)=>r.concat(n)));this.#i.set(t,{dirs:i,paths:e});for(let r of e){let n=this.#e.get(r);n?n.push(t):this.#e.set(r,[t])}for(let r of i){let n=this.#e.get(r);if(!n)this.#e.set(r,[new Set([t])]);else{let o=n.at(-1);o instanceof Set?o.add(t):n.push(new Set([t]))}}return this.#r(t)}#n(e){let t=this.#i.get(e);if(!t)throw new Error("function does not have any path reservations");return{paths:t.paths.map(i=>this.#e.get(i)),dirs:[...t.dirs].map(i=>this.#e.get(i))}}check(e){let{paths:t,dirs:i}=this.#n(e);return t.every(r=>r&&r[0]===e)&&i.every(r=>r&&r[0]instanceof Set&&r[0].has(e))}#r(e){return this.#s.has(e)||!this.check(e)?!1:(this.#s.add(e),e(()=>this.#t(e)),!0)}#t(e){if(!this.#s.has(e))return!1;let t=this.#i.get(e);if(!t)throw new Error("invalid reservation");let{paths:i,dirs:r}=t,n=new Set;for(let o of i){let h=this.#e.get(o);if(!h||h?.[0]!==e)continue;let a=h[1];if(!a){this.#e.delete(o);continue}if(h.shift(),typeof a=="function")n.add(a);else for(let l of a)n.add(l)}for(let o of r){let h=this.#e.get(o),a=h?.[0];if(!(!h||!(a instanceof Set)))if(a.size===1&&h.length===1){this.#e.delete(o);continue}else if(a.size===1){h.shift();let l=h[0];typeof l=="function"&&n.add(l)}else a.delete(e)}return this.#s.delete(e),n.forEach(o=>this.#r(o)),!0}};qi.PathReservations=gr});var Jn=d(Wi=>{"use strict";Object.defineProperty(Wi,"__esModule",{value:!0});Wi.umask=void 0;var Yh=()=>process.umask();Wi.umask=Yh});var Ir=d(k=>{"use strict";var Kh=k&&k.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),Vh=k&&k.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),lo=k&&k.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&Kh(t,e,i[r]);return Vh(t,e),t}})(),Ar=k&&k.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(k,"__esModule",{value:!0});k.UnpackSync=k.Unpack=void 0;var $h=lo(Ke()),Xh=Ar(__nccwpck_require__(4589)),uo=__nccwpck_require__(7598),m=Ar(__nccwpck_require__(3024)),g=Ar(__nccwpck_require__(6760)),co=jn(),fo=Kn(),U=tt(),Qh=pi(),Jh=Hs(),eo=lo(Gs()),el=Qn(),mo=yr(),tl=Jn(),to=Symbol("onEntry"),Tr=Symbol("checkFs"),io=Symbol("checkFs2"),Dr=Symbol("isReusable"),Z=Symbol("makeFs"),Pr=Symbol("file"),Nr=Symbol("directory"),Zi=Symbol("link"),so=Symbol("symlink"),ro=Symbol("hardlink"),Lt=Symbol("ensureNoSymlink"),no=Symbol("unsupported"),oo=Symbol("checkPath"),Or=Symbol("stripAbsolutePath"),Pe=Symbol("mkdir"),T=Symbol("onError"),Hi=Symbol("pending"),ao=Symbol("pend"),ct=Symbol("unpend"),Rr=Symbol("ended"),vr=Symbol("maybeClose"),Mr=Symbol("skip"),At=Symbol("doChown"),It=Symbol("uid"),Ft=Symbol("gid"),Ct=Symbol("checkedCwd"),il=process.env.TESTING_TAR_FAKE_PLATFORM||process.platform,Bt=il==="win32",sl=1024,rl=(s,e)=>{if(!Bt)return m.default.unlink(s,e);let t=s+".DELETE."+(0,uo.randomBytes)(16).toString("hex");m.default.rename(s,t,i=>{if(i)return e(i);m.default.unlink(t,e)})},nl=s=>{if(!Bt)return m.default.unlinkSync(s);let e=s+".DELETE."+(0,uo.randomBytes)(16).toString("hex");m.default.renameSync(s,e),m.default.unlinkSync(e)},ho=(s,e,t)=>s!==void 0&&s===s>>>0?s:e!==void 0&&e===e>>>0?e:t,Gi=class extends Qh.Parser{[Rr]=!1;[Ct]=!1;[Hi]=0;reservations=new el.PathReservations;transform;writable=!0;readable=!1;uid;gid;setOwner;preserveOwner;processGid;processUid;maxDepth;forceChown;win32;newer;keep;noMtime;preservePaths;unlink;cwd;strip;processUmask;umask;dmode;fmode;chmod;constructor(e={}){if(e.ondone=()=>{this[Rr]=!0,this[vr]()},super(e),this.transform=e.transform,this.chmod=!!e.chmod,typeof e.uid=="number"||typeof e.gid=="number"){if(typeof e.uid!="number"||typeof e.gid!="number")throw new TypeError("cannot set owner without number uid and gid");if(e.preserveOwner)throw new TypeError("cannot preserve owner in archive and also set owner explicitly");this.uid=e.uid,this.gid=e.gid,this.setOwner=!0}else this.uid=void 0,this.gid=void 0,this.setOwner=!1;this.preserveOwner=e.preserveOwner===void 0&&typeof e.uid!="number"?!!(process.getuid&&process.getuid()===0):!!e.preserveOwner,this.processUid=(this.preserveOwner||this.setOwner)&&process.getuid?process.getuid():void 0,this.processGid=(this.preserveOwner||this.setOwner)&&process.getgid?process.getgid():void 0,this.maxDepth=typeof e.maxDepth=="number"?e.maxDepth:sl,this.forceChown=e.forceChown===!0,this.win32=!!e.win32||Bt,this.newer=!!e.newer,this.keep=!!e.keep,this.noMtime=!!e.noMtime,this.preservePaths=!!e.preservePaths,this.unlink=!!e.unlink,this.cwd=(0,U.normalizeWindowsPath)(g.default.resolve(e.cwd||process.cwd())),this.strip=Number(e.strip)||0,this.processUmask=this.chmod?typeof e.processUmask=="number"?e.processUmask:(0,tl.umask)():0,this.umask=typeof e.umask=="number"?e.umask:this.processUmask,this.dmode=e.dmode||511&~this.umask,this.fmode=e.fmode||438&~this.umask,this.on("entry",t=>this[to](t))}warn(e,t,i={}){return(e==="TAR_BAD_ARCHIVE"||e==="TAR_ABORT")&&(i.recoverable=!1),super.warn(e,t,i)}[vr](){this[Rr]&&this[Hi]===0&&(this.emit("prefinish"),this.emit("finish"),this.emit("end"))}[Or](e,t){let i=e[t],{type:r}=e;if(!i||this.preservePaths)return!0;let[n,o]=(0,Jh.stripAbsolutePath)(i),h=o.replaceAll(/\\/g,"/").split("/");if(h.includes("..")||Bt&&/^[a-z]:\.\.$/i.test(h[0]??"")){if(t==="path"||r==="Link")return this.warn("TAR_ENTRY_ERROR",`${t} contains '..'`,{entry:e,[t]:i}),!1;let a=g.default.posix.dirname(e.path),l=g.default.posix.normalize(g.default.posix.join(a,h.join("/")));if(l.startsWith("../")||l==="..")return this.warn("TAR_ENTRY_ERROR",`${t} escapes extraction directory`,{entry:e,[t]:i}),!1}return n&&(e[t]=String(o),this.warn("TAR_ENTRY_INFO",`stripping ${n} from absolute ${t}`,{entry:e,[t]:i})),!0}[oo](e){let t=(0,U.normalizeWindowsPath)(e.path),i=t.split("/");if(this.strip){if(i.length<this.strip)return!1;if(e.type==="Link"){let r=(0,U.normalizeWindowsPath)(String(e.linkpath)).split("/");if(r.length>=this.strip)e.linkpath=r.slice(this.strip).join("/");else return!1}i.splice(0,this.strip),e.path=i.join("/")}if(isFinite(this.maxDepth)&&i.length>this.maxDepth)return this.warn("TAR_ENTRY_ERROR","path excessively deep",{entry:e,path:t,depth:i.length,maxDepth:this.maxDepth}),!1;if(!this[Or](e,"path")||!this[Or](e,"linkpath"))return!1;if(e.absolute=g.default.isAbsolute(e.path)?(0,U.normalizeWindowsPath)(g.default.resolve(e.path)):(0,U.normalizeWindowsPath)(g.default.resolve(this.cwd,e.path)),!this.preservePaths&&typeof e.absolute=="string"&&e.absolute.indexOf(this.cwd+"/")!==0&&e.absolute!==this.cwd)return this.warn("TAR_ENTRY_ERROR","path escaped extraction target",{entry:e,path:(0,U.normalizeWindowsPath)(e.path),resolvedPath:e.absolute,cwd:this.cwd}),!1;if(e.absolute===this.cwd&&e.type!=="Directory"&&e.type!=="GNUDumpDir")return!1;if(this.win32){let{root:r}=g.default.win32.parse(String(e.absolute));e.absolute=r+eo.encode(String(e.absolute).slice(r.length));let{root:n}=g.default.win32.parse(e.path);e.path=n+eo.encode(e.path.slice(n.length))}return!0}[to](e){if(!this[oo](e))return e.resume();switch(Xh.default.equal(typeof e.absolute,"string"),e.type){case"Directory":case"GNUDumpDir":e.mode&&(e.mode=e.mode|448);case"File":case"OldFile":case"ContiguousFile":case"Link":case"SymbolicLink":return this[Tr](e);default:return this[no](e)}}[T](e,t){e.name==="CwdError"?this.emit("error",e):(this.warn("TAR_ENTRY_ERROR",e,{entry:t}),this[ct](),t.resume())}[Pe](e,t,i){(0,fo.mkdir)((0,U.normalizeWindowsPath)(e),{uid:this.uid,gid:this.gid,processUid:this.processUid,processGid:this.processGid,umask:this.processUmask,preserve:this.preservePaths,unlink:this.unlink,cwd:this.cwd,mode:t},i)}[At](e){return this.forceChown||this.preserveOwner&&(typeof e.uid=="number"&&e.uid!==this.processUid||typeof e.gid=="number"&&e.gid!==this.processGid)||typeof this.uid=="number"&&this.uid!==this.processUid||typeof this.gid=="number"&&this.gid!==this.processGid}[It](e){return ho(this.uid,e.uid,this.processUid)}[Ft](e){return ho(this.gid,e.gid,this.processGid)}[Pr](e,t){let i=typeof e.mode=="number"?e.mode&4095:this.fmode,r=new $h.WriteStream(String(e.absolute),{flags:(0,co.getWriteFlag)(e.size),mode:i,autoClose:!1});r.on("error",a=>{r.fd&&m.default.close(r.fd,()=>{}),r.write=()=>!0,this[T](a,e),t()});let n=1,o=a=>{if(a){r.fd&&m.default.close(r.fd,()=>{}),this[T](a,e),t();return}--n===0&&r.fd!==void 0&&m.default.close(r.fd,l=>{l?this[T](l,e):this[ct](),t()})};r.on("finish",()=>{let a=String(e.absolute),l=r.fd;if(typeof l=="number"&&e.mtime&&!this.noMtime){n++;let u=e.atime||new Date,c=e.mtime;m.default.futimes(l,u,c,E=>E?m.default.utimes(a,u,c,D=>o(D&&E)):o())}if(typeof l=="number"&&this[At](e)){n++;let u=this[It](e),c=this[Ft](e);typeof u=="number"&&typeof c=="number"&&m.default.fchown(l,u,c,E=>E?m.default.chown(a,u,c,D=>o(D&&E)):o())}o()});let h=this.transform&&this.transform(e)||e;h!==e&&(h.on("error",a=>{this[T](a,e),t()}),e.pipe(h)),h.pipe(r)}[Nr](e,t){let i=typeof e.mode=="number"?e.mode&4095:this.dmode;this[Pe](String(e.absolute),i,r=>{if(r){this[T](r,e),t();return}let n=1,o=()=>{--n===0&&(t(),this[ct](),e.resume())};e.mtime&&!this.noMtime&&(n++,m.default.utimes(String(e.absolute),e.atime||new Date,e.mtime,o)),this[At](e)&&(n++,m.default.chown(String(e.absolute),Number(this[It](e)),Number(this[Ft](e)),o)),o()})}[no](e){e.unsupported=!0,this.warn("TAR_ENTRY_UNSUPPORTED",`unsupported entry type: ${e.type}`,{entry:e}),e.resume()}[so](e,t){let i=(0,U.normalizeWindowsPath)(g.default.relative(this.cwd,g.default.resolve(g.default.dirname(String(e.absolute)),String(e.linkpath)))).split("/");this[Lt](e,this.cwd,i,()=>this[Zi](e,String(e.linkpath),"symlink",t),r=>{this[T](r,e),t()})}[ro](e,t){let i=(0,U.normalizeWindowsPath)(g.default.resolve(this.cwd,String(e.linkpath))),r=(0,U.normalizeWindowsPath)(String(e.linkpath)).split("/");this[Lt](e,this.cwd,r,()=>this[Zi](e,i,"link",t),n=>{this[T](n,e),t()})}[Lt](e,t,i,r,n){let o=i.shift();if(this.preservePaths||o===void 0)return r();let h=g.default.resolve(t,o);m.default.lstat(h,(a,l)=>{if(a)return r();if(l?.isSymbolicLink())return n(new mo.SymlinkError(h,g.default.resolve(h,i.join("/"))));this[Lt](e,h,i,r,n)})}[ao](){this[Hi]++}[ct](){this[Hi]--,this[vr]()}[Mr](e){this[ct](),e.resume()}[Dr](e,t){return e.type==="File"&&!this.unlink&&t.isFile()&&t.nlink<=1&&!Bt}[Tr](e){this[ao]();let t=[e.path];e.linkpath&&t.push(e.linkpath),this.reservations.reserve(t,i=>this[io](e,i))}[io](e,t){let i=h=>{t(h)},r=()=>{this[Pe](this.cwd,this.dmode,h=>{if(h){this[T](h,e),i();return}this[Ct]=!0,n()})},n=()=>{if(e.absolute!==this.cwd){let h=(0,U.normalizeWindowsPath)(g.default.dirname(String(e.absolute)));if(h!==this.cwd)return this[Pe](h,this.dmode,a=>{if(a){this[T](a,e),i();return}o()})}o()},o=()=>{m.default.lstat(String(e.absolute),(h,a)=>{if(a&&(this.keep||this.newer&&a.mtime>(e.mtime??a.mtime))){this[Mr](e),i();return}if(h||this[Dr](e,a))return this[Z](null,e,i);if(a.isDirectory()){if(e.type==="Directory"){let l=this.chmod&&e.mode&&(a.mode&4095)!==e.mode,u=c=>this[Z](c??null,e,i);return l?m.default.chmod(String(e.absolute),Number(e.mode),u):u()}if(e.absolute!==this.cwd)return m.default.rmdir(String(e.absolute),l=>this[Z](l??null,e,i))}if(e.absolute===this.cwd)return this[Z](null,e,i);rl(String(e.absolute),l=>this[Z](l??null,e,i))})};this[Ct]?n():r()}[Z](e,t,i){if(e){this[T](e,t),i();return}switch(t.type){case"File":case"OldFile":case"ContiguousFile":return this[Pr](t,i);case"Link":return this[ro](t,i);case"SymbolicLink":return this[so](t,i);case"Directory":case"GNUDumpDir":return this[Nr](t,i)}}[Zi](e,t,i,r){m.default[i](t,String(e.absolute),n=>{n?this[T](n,e):(this[ct](),e.resume()),r()})}};k.Unpack=Gi;var Mt=s=>{try{return[null,s()]}catch(e){return[e,null]}},Lr=class extends Gi{sync=!0;[Z](e,t){return super[Z](e,t,()=>{})}[Tr](e){if(!this[Ct]){let n=this[Pe](this.cwd,this.dmode);if(n)return this[T](n,e);this[Ct]=!0}if(e.absolute!==this.cwd){let n=(0,U.normalizeWindowsPath)(g.default.dirname(String(e.absolute)));if(n!==this.cwd){let o=this[Pe](n,this.dmode);if(o)return this[T](o,e)}}let[t,i]=Mt(()=>m.default.lstatSync(String(e.absolute)));if(i&&(this.keep||this.newer&&i.mtime>(e.mtime??i.mtime)))return this[Mr](e);if(t||this[Dr](e,i))return this[Z](null,e);if(i.isDirectory()){if(e.type==="Directory"){let o=this.chmod&&e.mode&&(i.mode&4095)!==e.mode,[h]=o?Mt(()=>{m.default.chmodSync(String(e.absolute),Number(e.mode))}):[];return this[Z](h,e)}let[n]=Mt(()=>m.default.rmdirSync(String(e.absolute)));this[Z](n,e)}let[r]=e.absolute===this.cwd?[]:Mt(()=>nl(String(e.absolute)));this[Z](r,e)}[Pr](e,t){let i=typeof e.mode=="number"?e.mode&4095:this.fmode,r=h=>{let a;try{m.default.closeSync(n)}catch(l){a=l}(h||a)&&this[T](h||a,e),t()},n;try{n=m.default.openSync(String(e.absolute),(0,co.getWriteFlag)(e.size),i)}catch(h){return r(h)}let o=this.transform&&this.transform(e)||e;o!==e&&(o.on("error",h=>this[T](h,e)),e.pipe(o)),o.on("data",h=>{try{m.default.writeSync(n,h,0,h.length)}catch(a){r(a)}}),o.on("end",()=>{let h=null;if(e.mtime&&!this.noMtime){let a=e.atime||new Date,l=e.mtime;try{m.default.futimesSync(n,a,l)}catch(u){try{m.default.utimesSync(String(e.absolute),a,l)}catch{h=u}}}if(this[At](e)){let a=this[It](e),l=this[Ft](e);try{m.default.fchownSync(n,Number(a),Number(l))}catch(u){try{m.default.chownSync(String(e.absolute),Number(a),Number(l))}catch{h=h||u}}}r(h)})}[Nr](e,t){let i=typeof e.mode=="number"?e.mode&4095:this.dmode,r=this[Pe](String(e.absolute),i);if(r){this[T](r,e),t();return}if(e.mtime&&!this.noMtime)try{m.default.utimesSync(String(e.absolute),e.atime||new Date,e.mtime)}catch{}if(this[At](e))try{m.default.chownSync(String(e.absolute),Number(this[It](e)),Number(this[Ft](e)))}catch{}t(),e.resume()}[Pe](e,t){try{return(0,fo.mkdirSync)((0,U.normalizeWindowsPath)(e),{uid:this.uid,gid:this.gid,processUid:this.processUid,processGid:this.processGid,umask:this.processUmask,preserve:this.preservePaths,unlink:this.unlink,cwd:this.cwd,mode:t})}catch(i){return i}}[Lt](e,t,i,r,n){if(this.preservePaths||i.length===0)return r();let o=t;for(let h of i){o=g.default.resolve(o,h);let[a,l]=Mt(()=>m.default.lstatSync(o));if(a)return r();if(l.isSymbolicLink())return n(new mo.SymlinkError(o,g.default.resolve(t,i.join("/"))))}r()}[Zi](e,t,i,r){let n=`${i}Sync`;try{m.default[n](t,String(e.absolute)),r(),e.resume()}catch(o){return this[T](o,e)}}};k.UnpackSync=Lr});var Fr=d(G=>{"use strict";var ol=G&&G.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),al=G&&G.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),hl=G&&G.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&ol(t,e,i[r]);return al(t,e),t}})(),ll=G&&G.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(G,"__esModule",{value:!0});G.extract=void 0;var po=hl(Ke()),_o=ll(__nccwpck_require__(3024)),ul=rt(),cl=Ve(),Yi=Ir(),fl=s=>{let e=new Yi.UnpackSync(s),t=s.file,i=_o.default.statSync(t),r=s.maxReadSize||16*1024*1024;new po.ReadStreamSync(t,{readSize:r,size:i.size}).pipe(e)},dl=(s,e)=>{let t=new Yi.Unpack(s),i=s.maxReadSize||16*1024*1024,r=s.file;return new Promise((o,h)=>{t.on("error",h),t.on("close",o),_o.default.stat(r,(a,l)=>{if(a)h(a);else{let u=new po.ReadStream(r,{readSize:i,size:l.size});u.on("error",h),u.pipe(t)}})})};G.extract=(0,cl.makeCommand)(fl,dl,s=>new Yi.UnpackSync(s),s=>new Yi.Unpack(s),(s,e)=>{e?.length&&(0,ul.filesFilter)(s,e)})});var Ki=d(ft=>{"use strict";var wo=ft&&ft.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(ft,"__esModule",{value:!0});ft.replace=void 0;var yo=Ke(),q=wo(__nccwpck_require__(3024)),Eo=wo(__nccwpck_require__(6760)),bo=et(),So=rt(),ml=Ve(),pl=Xt(),go=Fi(),_l=(s,e)=>{let t=new go.PackSync(s),i=!0,r,n;try{try{r=q.default.openSync(s.file,"r+")}catch(a){if(a?.code==="ENOENT")r=q.default.openSync(s.file,"w+");else throw a}let o=q.default.fstatSync(r),h=Buffer.alloc(512);e:for(n=0;n<o.size;n+=512){for(let u=0,c=0;u<512;u+=c){if(c=q.default.readSync(r,h,u,h.length-u,n+u),n===0&&h[0]===31&&h[1]===139)throw new Error("cannot append to compressed archives");if(!c)break e}let a=new bo.Header(h);if(!a.cksumValid)break;let l=512*Math.ceil((a.size||0)/512);if(n+l+512>o.size)break;n+=l,s.mtimeCache&&a.mtime&&s.mtimeCache.set(String(a.path),a.mtime)}i=!1,wl(s,t,n,r,e)}finally{if(i)try{q.default.closeSync(r)}catch{}}},wl=(s,e,t,i,r)=>{let n=new yo.WriteStreamSync(s.file,{fd:i,start:t});e.pipe(n),El(e,r)},yl=(s,e)=>{e=Array.from(e);let t=new go.Pack(s),i=(n,o,h)=>{let a=(D,A)=>{D?q.default.close(n,w=>h(D)):h(null,A)},l=0;if(o===0)return a(null,0);let u=0,c=Buffer.alloc(512),E=(D,A)=>{if(D||A===void 0)return a(D);if(u+=A,u<512&&A)return q.default.read(n,c,u,c.length-u,l+u,E);if(l===0&&c[0]===31&&c[1]===139)return a(new Error("cannot append to compressed archives"));if(u<512)return a(null,l);let w=new bo.Header(c);if(!w.cksumValid)return a(null,l);let P=512*Math.ceil((w.size??0)/512);if(l+P+512>o||(l+=P+512,l>=o))return a(null,l);s.mtimeCache&&w.mtime&&s.mtimeCache.set(String(w.path),w.mtime),u=0,q.default.read(n,c,0,512,l,E)};q.default.read(n,c,0,512,l,E)};return new Promise((n,o)=>{t.on("error",o);let h="r+",a=(l,u)=>{if(l&&l.code==="ENOENT"&&h==="r+")return h="w+",q.default.open(s.file,h,a);if(l||!u)return o(l);q.default.fstat(u,(c,E)=>{if(c)return q.default.close(u,()=>o(c));i(u,E.size,(D,A)=>{if(D)return o(D);let w=new yo.WriteStream(s.file,{fd:u,start:A});t.pipe(w),w.on("error",o),w.on("close",n),bl(t,e)})})};q.default.open(s.file,h,a)})},El=(s,e)=>{e.forEach(t=>{t.charAt(0)==="@"?(0,So.list)({file:Eo.default.resolve(s.cwd,t.slice(1)),sync:!0,noResume:!0,onReadEntry:i=>s.add(i)}):s.add(t)}),s.end()},bl=async(s,e)=>{for(let t of e)t.charAt(0)==="@"?await(0,So.list)({file:Eo.default.resolve(String(s.cwd),t.slice(1)),noResume:!0,onReadEntry:i=>s.add(i)}):s.add(t);s.end()};ft.replace=(0,ml.makeCommand)(_l,yl,()=>{throw new TypeError("file is required")},()=>{throw new TypeError("file is required")},(s,e)=>{if(!(0,pl.isFile)(s))throw new TypeError("file is required");if(s.gzip||s.brotli||s.zstd||s.file.endsWith(".br")||s.file.endsWith(".tbr"))throw new TypeError("cannot append to compressed archives");if(!e?.length)throw new TypeError("no paths specified to add/replace")})});var Cr=d(Vi=>{"use strict";Object.defineProperty(Vi,"__esModule",{value:!0});Vi.update=void 0;var Sl=Ve(),zt=Ki();Vi.update=(0,Sl.makeCommand)(zt.replace.syncFile,zt.replace.asyncFile,zt.replace.syncNoFile,zt.replace.asyncNoFile,(s,e=[])=>{zt.replace.validate?.(s,e),gl(s)});var gl=s=>{let e=s.filter;s.mtimeCache||(s.mtimeCache=new Map),s.filter=e?(t,i)=>e(t,i)&&!((s.mtimeCache?.get(t)??i.mtime??0)>(i.mtime??0)):(t,i)=>!((s.mtimeCache?.get(t)??i.mtime??0)>(i.mtime??0))}});var Oo=exports&&exports.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),Ol=exports&&exports.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),Y=exports&&exports.__exportStar||function(s,e){for(var t in s)t!=="default"&&!Object.prototype.hasOwnProperty.call(e,t)&&Oo(e,s,t)},Rl=exports&&exports.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&Oo(t,e,i[r]);return Ol(t,e),t}})();Object.defineProperty(exports, "__esModule", ({value:!0}));exports.u=exports.types=exports.r=exports.t=exports.x=exports.c=void 0;Y(mr(),exports);var vl=mr();Object.defineProperty(exports, "c", ({enumerable:!0,get:function(){return vl.create}}));Y(Fr(),exports);var Tl=Fr();Object.defineProperty(exports, "x", ({enumerable:!0,get:function(){return Tl.extract}}));Y(et(),exports);Y(rt(),exports);var Dl=rt();Object.defineProperty(exports, "t", ({enumerable:!0,get:function(){return Dl.list}}));Y(Fi(),exports);Y(pi(),exports);Y(ii(),exports);Y(Fs(),exports);Y(Ki(),exports);var Pl=Ki();Object.defineProperty(exports, "r", ({enumerable:!0,get:function(){return Pl.replace}}));exports.types=Rl(Ps());Y(Ir(),exports);Y(Cr(),exports);var Nl=Cr();Object.defineProperty(exports, "u", ({enumerable:!0,get:function(){return Nl.update}}));Y(sr(),exports);
+var d=(s,e)=>()=>(e||s((e={exports:{}}).exports,e),e.exports);var We=d(F=>{"use strict";var Do=F&&F.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(F,"__esModule",{value:!0});F.Minipass=F.isWritable=F.isReadable=F.isStream=void 0;var kr=typeof process=="object"&&process?process:{stdout:null,stderr:null},ss=__nccwpck_require__(8474),qr=Do(__nccwpck_require__(7075)),Po=__nccwpck_require__(6193),No=s=>!!s&&typeof s=="object"&&(s instanceof Zt||s instanceof qr.default||(0,F.isReadable)(s)||(0,F.isWritable)(s));F.isStream=No;var Mo=s=>!!s&&typeof s=="object"&&s instanceof ss.EventEmitter&&typeof s.pipe=="function"&&s.pipe!==qr.default.Writable.prototype.pipe;F.isReadable=Mo;var Lo=s=>!!s&&typeof s=="object"&&s instanceof ss.EventEmitter&&typeof s.write=="function"&&typeof s.end=="function";F.isWritable=Lo;var ce=Symbol("EOF"),ue=Symbol("maybeEmitEnd"),we=Symbol("emittedEnd"),jt=Symbol("emittingEnd"),dt=Symbol("emittedError"),Ut=Symbol("closed"),xr=Symbol("read"),qt=Symbol("flush"),jr=Symbol("flushChunk"),K=Symbol("encoding"),Ue=Symbol("decoder"),R=Symbol("flowing"),mt=Symbol("paused"),qe=Symbol("resume"),O=Symbol("buffer"),I=Symbol("pipes"),v=Symbol("bufferLength"),Xi=Symbol("bufferPush"),Wt=Symbol("bufferShift"),N=Symbol("objectMode"),E=Symbol("destroyed"),Qi=Symbol("error"),Ji=Symbol("emitData"),Ur=Symbol("emitEnd"),es=Symbol("emitEnd2"),J=Symbol("async"),ts=Symbol("abort"),Ht=Symbol("aborted"),pt=Symbol("signal"),Ne=Symbol("dataListeners"),x=Symbol("discarded"),_t=s=>Promise.resolve().then(s),Ao=s=>s(),Io=s=>s==="end"||s==="finish"||s==="prefinish",Fo=s=>s instanceof ArrayBuffer||!!s&&typeof s=="object"&&s.constructor&&s.constructor.name==="ArrayBuffer"&&s.byteLength>=0,Co=s=>!Buffer.isBuffer(s)&&ArrayBuffer.isView(s),Gt=class{src;dest;opts;ondrain;constructor(e,t,i){this.src=e,this.dest=t,this.opts=i,this.ondrain=()=>e[qe](),this.dest.on("drain",this.ondrain)}unpipe(){this.dest.removeListener("drain",this.ondrain)}proxyErrors(e){}end(){this.unpipe(),this.opts.end&&this.dest.end()}},is=class extends Gt{unpipe(){this.src.removeListener("error",this.proxyErrors),super.unpipe()}constructor(e,t,i){super(e,t,i),this.proxyErrors=r=>this.dest.emit("error",r),e.on("error",this.proxyErrors)}},Bo=s=>!!s.objectMode,zo=s=>!s.objectMode&&!!s.encoding&&s.encoding!=="buffer",Zt=class extends ss.EventEmitter{[R]=!1;[mt]=!1;[I]=[];[O]=[];[N];[K];[J];[Ue];[ce]=!1;[we]=!1;[jt]=!1;[Ut]=!1;[dt]=null;[v]=0;[E]=!1;[pt];[Ht]=!1;[Ne]=0;[x]=!1;writable=!0;readable=!0;constructor(...e){let t=e[0]||{};if(super(),t.objectMode&&typeof t.encoding=="string")throw new TypeError("Encoding and objectMode may not be used together");Bo(t)?(this[N]=!0,this[K]=null):zo(t)?(this[K]=t.encoding,this[N]=!1):(this[N]=!1,this[K]=null),this[J]=!!t.async,this[Ue]=this[K]?new Po.StringDecoder(this[K]):null,t&&t.debugExposeBuffer===!0&&Object.defineProperty(this,"buffer",{get:()=>this[O]}),t&&t.debugExposePipes===!0&&Object.defineProperty(this,"pipes",{get:()=>this[I]});let{signal:i}=t;i&&(this[pt]=i,i.aborted?this[ts]():i.addEventListener("abort",()=>this[ts]()))}get bufferLength(){return this[v]}get encoding(){return this[K]}set encoding(e){throw new Error("Encoding must be set at instantiation time")}setEncoding(e){throw new Error("Encoding must be set at instantiation time")}get objectMode(){return this[N]}set objectMode(e){throw new Error("objectMode must be set at instantiation time")}get async(){return this[J]}set async(e){this[J]=this[J]||!!e}[ts](){this[Ht]=!0,this.emit("abort",this[pt]?.reason),this.destroy(this[pt]?.reason)}get aborted(){return this[Ht]}set aborted(e){}write(e,t,i){if(this[Ht])return!1;if(this[ce])throw new Error("write after end");if(this[E])return this.emit("error",Object.assign(new Error("Cannot call write after a stream was destroyed"),{code:"ERR_STREAM_DESTROYED"})),!0;typeof t=="function"&&(i=t,t="utf8"),t||(t="utf8");let r=this[J]?_t:Ao;if(!this[N]&&!Buffer.isBuffer(e)){if(Co(e))e=Buffer.from(e.buffer,e.byteOffset,e.byteLength);else if(Fo(e))e=Buffer.from(e);else if(typeof e!="string")throw new Error("Non-contiguous data written to non-objectMode stream")}return this[N]?(this[R]&&this[v]!==0&&this[qt](!0),this[R]?this.emit("data",e):this[Xi](e),this[v]!==0&&this.emit("readable"),i&&r(i),this[R]):e.length?(typeof e=="string"&&!(t===this[K]&&!this[Ue]?.lastNeed)&&(e=Buffer.from(e,t)),Buffer.isBuffer(e)&&this[K]&&(e=this[Ue].write(e)),this[R]&&this[v]!==0&&this[qt](!0),this[R]?this.emit("data",e):this[Xi](e),this[v]!==0&&this.emit("readable"),i&&r(i),this[R]):(this[v]!==0&&this.emit("readable"),i&&r(i),this[R])}read(e){if(this[E])return null;if(this[x]=!1,this[v]===0||e===0||e&&e>this[v])return this[ue](),null;this[N]&&(e=null),this[O].length>1&&!this[N]&&(this[O]=[this[K]?this[O].join(""):Buffer.concat(this[O],this[v])]);let t=this[xr](e||null,this[O][0]);return this[ue](),t}[xr](e,t){if(this[N])this[Wt]();else{let i=t;e===i.length||e===null?this[Wt]():typeof i=="string"?(this[O][0]=i.slice(e),t=i.slice(0,e),this[v]-=e):(this[O][0]=i.subarray(e),t=i.subarray(0,e),this[v]-=e)}return this.emit("data",t),!this[O].length&&!this[ce]&&this.emit("drain"),t}end(e,t,i){return typeof e=="function"&&(i=e,e=void 0),typeof t=="function"&&(i=t,t="utf8"),e!==void 0&&this.write(e,t),i&&this.once("end",i),this[ce]=!0,this.writable=!1,(this[R]||!this[mt])&&this[ue](),this}[qe](){this[E]||(!this[Ne]&&!this[I].length&&(this[x]=!0),this[mt]=!1,this[R]=!0,this.emit("resume"),this[O].length?this[qt]():this[ce]?this[ue]():this.emit("drain"))}resume(){return this[qe]()}pause(){this[R]=!1,this[mt]=!0,this[x]=!1}get destroyed(){return this[E]}get flowing(){return this[R]}get paused(){return this[mt]}[Xi](e){this[N]?this[v]+=1:this[v]+=e.length,this[O].push(e)}[Wt](){return this[N]?this[v]-=1:this[v]-=this[O][0].length,this[O].shift()}[qt](e=!1){do;while(this[jr](this[Wt]())&&this[O].length);!e&&!this[O].length&&!this[ce]&&this.emit("drain")}[jr](e){return this.emit("data",e),this[R]}pipe(e,t){if(this[E])return e;this[x]=!1;let i=this[we];return t=t||{},e===kr.stdout||e===kr.stderr?t.end=!1:t.end=t.end!==!1,t.proxyErrors=!!t.proxyErrors,i?t.end&&e.end():(this[I].push(t.proxyErrors?new is(this,e,t):new Gt(this,e,t)),this[J]?_t(()=>this[qe]()):this[qe]()),e}unpipe(e){let t=this[I].find(i=>i.dest===e);t&&(this[I].length===1?(this[R]&&this[Ne]===0&&(this[R]=!1),this[I]=[]):this[I].splice(this[I].indexOf(t),1),t.unpipe())}addListener(e,t){return this.on(e,t)}on(e,t){let i=super.on(e,t);if(e==="data")this[x]=!1,this[Ne]++,!this[I].length&&!this[R]&&this[qe]();else if(e==="readable"&&this[v]!==0)super.emit("readable");else if(Io(e)&&this[we])super.emit(e),this.removeAllListeners(e);else if(e==="error"&&this[dt]){let r=t;this[J]?_t(()=>r.call(this,this[dt])):r.call(this,this[dt])}return i}removeListener(e,t){return this.off(e,t)}off(e,t){let i=super.off(e,t);return e==="data"&&(this[Ne]=this.listeners("data").length,this[Ne]===0&&!this[x]&&!this[I].length&&(this[R]=!1)),i}removeAllListeners(e){let t=super.removeAllListeners(e);return(e==="data"||e===void 0)&&(this[Ne]=0,!this[x]&&!this[I].length&&(this[R]=!1)),t}get emittedEnd(){return this[we]}[ue](){!this[jt]&&!this[we]&&!this[E]&&this[O].length===0&&this[ce]&&(this[jt]=!0,this.emit("end"),this.emit("prefinish"),this.emit("finish"),this[Ut]&&this.emit("close"),this[jt]=!1)}emit(e,...t){let i=t[0];if(e!=="error"&&e!=="close"&&e!==E&&this[E])return!1;if(e==="data")return!this[N]&&!i?!1:this[J]?(_t(()=>this[Ji](i)),!0):this[Ji](i);if(e==="end")return this[Ur]();if(e==="close"){if(this[Ut]=!0,!this[we]&&!this[E])return!1;let n=super.emit("close");return this.removeAllListeners("close"),n}else if(e==="error"){this[dt]=i,super.emit(Qi,i);let n=!this[pt]||this.listeners("error").length?super.emit("error",i):!1;return this[ue](),n}else if(e==="resume"){let n=super.emit("resume");return this[ue](),n}else if(e==="finish"||e==="prefinish"){let n=super.emit(e);return this.removeAllListeners(e),n}let r=super.emit(e,...t);return this[ue](),r}[Ji](e){for(let i of this[I])i.dest.write(e)===!1&&this.pause();let t=this[x]?!1:super.emit("data",e);return this[ue](),t}[Ur](){return this[we]?!1:(this[we]=!0,this.readable=!1,this[J]?(_t(()=>this[es]()),!0):this[es]())}[es](){if(this[Ue]){let t=this[Ue].end();if(t){for(let i of this[I])i.dest.write(t);this[x]||super.emit("data",t)}}for(let t of this[I])t.end();let e=super.emit("end");return this.removeAllListeners("end"),e}async collect(){let e=Object.assign([],{dataLength:0});this[N]||(e.dataLength=0);let t=this.promise();return this.on("data",i=>{e.push(i),this[N]||(e.dataLength+=i.length)}),await t,e}async concat(){if(this[N])throw new Error("cannot concat in objectMode");let e=await this.collect();return this[K]?e.join(""):Buffer.concat(e,e.dataLength)}async promise(){return new Promise((e,t)=>{this.on(E,()=>t(new Error("stream destroyed"))),this.on("error",i=>t(i)),this.on("end",()=>e())})}[Symbol.asyncIterator](){this[x]=!1;let e=!1,t=async()=>(this.pause(),e=!0,{value:void 0,done:!0});return{next:()=>{if(e)return t();let r=this.read();if(r!==null)return Promise.resolve({done:!1,value:r});if(this[ce])return t();let n,o,a=u=>{this.off("data",h),this.off("end",l),this.off(E,c),t(),o(u)},h=u=>{this.off("error",a),this.off("end",l),this.off(E,c),this.pause(),n({value:u,done:!!this[ce]})},l=()=>{this.off("error",a),this.off("data",h),this.off(E,c),t(),n({done:!0,value:void 0})},c=()=>a(new Error("stream destroyed"));return new Promise((u,b)=>{o=b,n=u,this.once(E,c),this.once("error",a),this.once("end",l),this.once("data",h)})},throw:t,return:t,[Symbol.asyncIterator](){return this},[Symbol.asyncDispose]:async()=>{}}}[Symbol.iterator](){this[x]=!1;let e=!1,t=()=>(this.pause(),this.off(Qi,t),this.off(E,t),this.off("end",t),e=!0,{done:!0,value:void 0}),i=()=>{if(e)return t();let r=this.read();return r===null?t():{done:!1,value:r}};return this.once("end",t),this.once(Qi,t),this.once(E,t),{next:i,throw:t,return:t,[Symbol.iterator](){return this},[Symbol.dispose]:()=>{}}}destroy(e){if(this[E])return e?this.emit("error",e):this.emit(E),this;this[E]=!0,this[x]=!0,this[O].length=0,this[v]=0;let t=this;return typeof t.close=="function"&&!this[Ut]&&t.close(),e?this.emit("error",e):this.emit(E),this}static get isStream(){return F.isStream}};F.Minipass=Zt});var Ke=d(W=>{"use strict";var Wr=W&&W.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(W,"__esModule",{value:!0});W.WriteStreamSync=W.WriteStream=W.ReadStreamSync=W.ReadStream=void 0;var ko=Wr(__nccwpck_require__(4434)),z=Wr(__nccwpck_require__(9896)),xo=We(),jo=z.default.writev,Ee=Symbol("_autoClose"),$=Symbol("_close"),wt=Symbol("_ended"),p=Symbol("_fd"),rs=Symbol("_finished"),de=Symbol("_flags"),ns=Symbol("_flush"),ls=Symbol("_handleChunk"),cs=Symbol("_makeBuf"),Et=Symbol("_mode"),Yt=Symbol("_needDrain"),Ze=Symbol("_onerror"),Ye=Symbol("_onopen"),os=Symbol("_onread"),He=Symbol("_onwrite"),be=Symbol("_open"),V=Symbol("_path"),ye=Symbol("_pos"),ee=Symbol("_queue"),Ge=Symbol("_read"),as=Symbol("_readSize"),fe=Symbol("_reading"),yt=Symbol("_remain"),hs=Symbol("_size"),Kt=Symbol("_write"),Me=Symbol("_writing"),Vt=Symbol("_defaultFlag"),Le=Symbol("_errored"),$t=class extends xo.Minipass{[Le]=!1;[p];[V];[as];[fe]=!1;[hs];[yt];[Ee];constructor(e,t){if(t=t||{},super(t),this.readable=!0,this.writable=!1,typeof e!="string")throw new TypeError("path must be a string");this[Le]=!1,this[p]=typeof t.fd=="number"?t.fd:void 0,this[V]=e,this[as]=t.readSize||16*1024*1024,this[fe]=!1,this[hs]=typeof t.size=="number"?t.size:1/0,this[yt]=this[hs],this[Ee]=typeof t.autoClose=="boolean"?t.autoClose:!0,typeof this[p]=="number"?this[Ge]():this[be]()}get fd(){return this[p]}get path(){return this[V]}write(){throw new TypeError("this is a readable stream")}end(){throw new TypeError("this is a readable stream")}[be](){z.default.open(this[V],"r",(e,t)=>this[Ye](e,t))}[Ye](e,t){e?this[Ze](e):(this[p]=t,this.emit("open",t),this[Ge]())}[cs](){return Buffer.allocUnsafe(Math.min(this[as],this[yt]))}[Ge](){if(!this[fe]){this[fe]=!0;let e=this[cs]();if(e.length===0)return process.nextTick(()=>this[os](null,0,e));z.default.read(this[p],e,0,e.length,null,(t,i,r)=>this[os](t,i,r))}}[os](e,t,i){this[fe]=!1,e?this[Ze](e):this[ls](t,i)&&this[Ge]()}[$](){if(this[Ee]&&typeof this[p]=="number"){let e=this[p];this[p]=void 0,z.default.close(e,t=>t?this.emit("error",t):this.emit("close"))}}[Ze](e){this[fe]=!0,this[$](),this.emit("error",e)}[ls](e,t){let i=!1;return this[yt]-=e,e>0&&(i=super.write(e<t.length?t.subarray(0,e):t)),(e===0||this[yt]<=0)&&(i=!1,this[$](),super.end()),i}emit(e,...t){switch(e){case"prefinish":case"finish":return!1;case"drain":return typeof this[p]=="number"&&this[Ge](),!1;case"error":return this[Le]?!1:(this[Le]=!0,super.emit(e,...t));default:return super.emit(e,...t)}}};W.ReadStream=$t;var us=class extends $t{[be](){let e=!0;try{this[Ye](null,z.default.openSync(this[V],"r")),e=!1}finally{e&&this[$]()}}[Ge](){let e=!0;try{if(!this[fe]){this[fe]=!0;do{let t=this[cs](),i=t.length===0?0:z.default.readSync(this[p],t,0,t.length,null);if(!this[ls](i,t))break}while(!0);this[fe]=!1}e=!1}finally{e&&this[$]()}}[$](){if(this[Ee]&&typeof this[p]=="number"){let e=this[p];this[p]=void 0,z.default.closeSync(e),this.emit("close")}}};W.ReadStreamSync=us;var Xt=class extends ko.default{readable=!1;writable=!0;[Le]=!1;[Me]=!1;[wt]=!1;[ee]=[];[Yt]=!1;[V];[Et];[Ee];[p];[Vt];[de];[rs]=!1;[ye];constructor(e,t){t=t||{},super(t),this[V]=e,this[p]=typeof t.fd=="number"?t.fd:void 0,this[Et]=t.mode===void 0?438:t.mode,this[ye]=typeof t.start=="number"?t.start:void 0,this[Ee]=typeof t.autoClose=="boolean"?t.autoClose:!0;let i=this[ye]!==void 0?"r+":"w";this[Vt]=t.flags===void 0,this[de]=t.flags===void 0?i:t.flags,this[p]===void 0&&this[be]()}emit(e,...t){if(e==="error"){if(this[Le])return!1;this[Le]=!0}return super.emit(e,...t)}get fd(){return this[p]}get path(){return this[V]}[Ze](e){this[$](),this[Me]=!0,this.emit("error",e)}[be](){z.default.open(this[V],this[de],this[Et],(e,t)=>this[Ye](e,t))}[Ye](e,t){this[Vt]&&this[de]==="r+"&&e&&e.code==="ENOENT"?(this[de]="w",this[be]()):e?this[Ze](e):(this[p]=t,this.emit("open",t),this[Me]||this[ns]())}end(e,t){return e&&this.write(e,t),this[wt]=!0,!this[Me]&&!this[ee].length&&typeof this[p]=="number"&&this[He](null,0),this}write(e,t){return typeof e=="string"&&(e=Buffer.from(e,t)),this[wt]?(this.emit("error",new Error("write() after end()")),!1):this[p]===void 0||this[Me]||this[ee].length?(this[ee].push(e),this[Yt]=!0,!1):(this[Me]=!0,this[Kt](e),!0)}[Kt](e){z.default.write(this[p],e,0,e.length,this[ye],(t,i)=>this[He](t,i))}[He](e,t){e?this[Ze](e):(this[ye]!==void 0&&typeof t=="number"&&(this[ye]+=t),this[ee].length?this[ns]():(this[Me]=!1,this[wt]&&!this[rs]?(this[rs]=!0,this[$](),this.emit("finish")):this[Yt]&&(this[Yt]=!1,this.emit("drain"))))}[ns](){if(this[ee].length===0)this[wt]&&this[He](null,0);else if(this[ee].length===1)this[Kt](this[ee].pop());else{let e=this[ee];this[ee]=[],jo(this[p],e,this[ye],(t,i)=>this[He](t,i))}}[$](){if(this[Ee]&&typeof this[p]=="number"){let e=this[p];this[p]=void 0,z.default.close(e,t=>t?this.emit("error",t):this.emit("close"))}}};W.WriteStream=Xt;var fs=class extends Xt{[be](){let e;if(this[Vt]&&this[de]==="r+")try{e=z.default.openSync(this[V],this[de],this[Et])}catch(t){if(t?.code==="ENOENT")return this[de]="w",this[be]();throw t}else e=z.default.openSync(this[V],this[de],this[Et]);this[Ye](null,e)}[$](){if(this[Ee]&&typeof this[p]=="number"){let e=this[p];this[p]=void 0,z.default.closeSync(e),this.emit("close")}}[Kt](e){let t=!0;try{this[He](null,z.default.writeSync(this[p],e,0,e.length,this[ye])),t=!1}finally{if(t)try{this[$]()}catch{}}}};W.WriteStreamSync=fs});var Qt=d(S=>{"use strict";Object.defineProperty(S,"__esModule",{value:!0});S.dealias=S.isNoFile=S.isFile=S.isAsync=S.isSync=S.isAsyncNoFile=S.isSyncNoFile=S.isAsyncFile=S.isSyncFile=void 0;var Uo=new Map([["C","cwd"],["f","file"],["z","gzip"],["P","preservePaths"],["U","unlink"],["strip-components","strip"],["stripComponents","strip"],["keep-newer","newer"],["keepNewer","newer"],["keep-newer-files","newer"],["keepNewerFiles","newer"],["k","keep"],["keep-existing","keep"],["keepExisting","keep"],["m","noMtime"],["no-mtime","noMtime"],["p","preserveOwner"],["L","follow"],["h","follow"],["onentry","onReadEntry"]]),qo=s=>!!s.sync&&!!s.file;S.isSyncFile=qo;var Wo=s=>!s.sync&&!!s.file;S.isAsyncFile=Wo;var Ho=s=>!!s.sync&&!s.file;S.isSyncNoFile=Ho;var Go=s=>!s.sync&&!s.file;S.isAsyncNoFile=Go;var Zo=s=>!!s.sync;S.isSync=Zo;var Yo=s=>!s.sync;S.isAsync=Yo;var Ko=s=>!!s.file;S.isFile=Ko;var Vo=s=>!s.file;S.isNoFile=Vo;var $o=s=>{let e=Uo.get(s);return e||s},Xo=(s={})=>{if(!s)return{};let e={};for(let[t,i]of Object.entries(s)){let r=$o(t);e[r]=i}return e.chmod===void 0&&e.noChmod===!1&&(e.chmod=!0),delete e.noChmod,e};S.dealias=Xo});var Ve=d(Jt=>{"use strict";Object.defineProperty(Jt,"__esModule",{value:!0});Jt.makeCommand=void 0;var bt=Qt(),Qo=(s,e,t,i,r)=>Object.assign((n=[],o,a)=>{Array.isArray(n)&&(o=n,n={}),typeof o=="function"&&(a=o,o=void 0),o=o?Array.from(o):[];let h=(0,bt.dealias)(n);if(r?.(h,o),(0,bt.isSyncFile)(h)){if(typeof a=="function")throw new TypeError("callback not supported for sync tar functions");return s(h,o)}else if((0,bt.isAsyncFile)(h)){let l=e(h,o);return a?l.then(()=>a(),a):l}else if((0,bt.isSyncNoFile)(h)){if(typeof a=="function")throw new TypeError("callback not supported for sync tar functions");return t(h,o)}else if((0,bt.isAsyncNoFile)(h)){if(typeof a=="function")throw new TypeError("callback only supported with file option");return i(h,o)}throw new Error("impossible options??")},{syncFile:s,asyncFile:e,syncNoFile:t,asyncNoFile:i,validate:r});Jt.makeCommand=Qo});var ds=d($e=>{"use strict";var Jo=$e&&$e.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty($e,"__esModule",{value:!0});$e.constants=void 0;var ea=Jo(__nccwpck_require__(3106)),ta=ea.default.constants||{ZLIB_VERNUM:4736};$e.constants=Object.freeze(Object.assign(Object.create(null),{Z_NO_FLUSH:0,Z_PARTIAL_FLUSH:1,Z_SYNC_FLUSH:2,Z_FULL_FLUSH:3,Z_FINISH:4,Z_BLOCK:5,Z_OK:0,Z_STREAM_END:1,Z_NEED_DICT:2,Z_ERRNO:-1,Z_STREAM_ERROR:-2,Z_DATA_ERROR:-3,Z_MEM_ERROR:-4,Z_BUF_ERROR:-5,Z_VERSION_ERROR:-6,Z_NO_COMPRESSION:0,Z_BEST_SPEED:1,Z_BEST_COMPRESSION:9,Z_DEFAULT_COMPRESSION:-1,Z_FILTERED:1,Z_HUFFMAN_ONLY:2,Z_RLE:3,Z_FIXED:4,Z_DEFAULT_STRATEGY:0,DEFLATE:1,INFLATE:2,GZIP:3,GUNZIP:4,DEFLATERAW:5,INFLATERAW:6,UNZIP:7,BROTLI_DECODE:8,BROTLI_ENCODE:9,Z_MIN_WINDOWBITS:8,Z_MAX_WINDOWBITS:15,Z_DEFAULT_WINDOWBITS:15,Z_MIN_CHUNK:64,Z_MAX_CHUNK:1/0,Z_DEFAULT_CHUNK:16384,Z_MIN_MEMLEVEL:1,Z_MAX_MEMLEVEL:9,Z_DEFAULT_MEMLEVEL:8,Z_MIN_LEVEL:-1,Z_MAX_LEVEL:9,Z_DEFAULT_LEVEL:-1,BROTLI_OPERATION_PROCESS:0,BROTLI_OPERATION_FLUSH:1,BROTLI_OPERATION_FINISH:2,BROTLI_OPERATION_EMIT_METADATA:3,BROTLI_MODE_GENERIC:0,BROTLI_MODE_TEXT:1,BROTLI_MODE_FONT:2,BROTLI_DEFAULT_MODE:0,BROTLI_MIN_QUALITY:0,BROTLI_MAX_QUALITY:11,BROTLI_DEFAULT_QUALITY:11,BROTLI_MIN_WINDOW_BITS:10,BROTLI_MAX_WINDOW_BITS:24,BROTLI_LARGE_MAX_WINDOW_BITS:30,BROTLI_DEFAULT_WINDOW:22,BROTLI_MIN_INPUT_BLOCK_BITS:16,BROTLI_MAX_INPUT_BLOCK_BITS:24,BROTLI_PARAM_MODE:0,BROTLI_PARAM_QUALITY:1,BROTLI_PARAM_LGWIN:2,BROTLI_PARAM_LGBLOCK:3,BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING:4,BROTLI_PARAM_SIZE_HINT:5,BROTLI_PARAM_LARGE_WINDOW:6,BROTLI_PARAM_NPOSTFIX:7,BROTLI_PARAM_NDIRECT:8,BROTLI_DECODER_RESULT_ERROR:0,BROTLI_DECODER_RESULT_SUCCESS:1,BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT:2,BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT:3,BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION:0,BROTLI_DECODER_PARAM_LARGE_WINDOW:1,BROTLI_DECODER_NO_ERROR:0,BROTLI_DECODER_SUCCESS:1,BROTLI_DECODER_NEEDS_MORE_INPUT:2,BROTLI_DECODER_NEEDS_MORE_OUTPUT:3,BROTLI_DECODER_ERROR_FORMAT_EXUBERANT_NIBBLE:-1,BROTLI_DECODER_ERROR_FORMAT_RESERVED:-2,BROTLI_DECODER_ERROR_FORMAT_EXUBERANT_META_NIBBLE:-3,BROTLI_DECODER_ERROR_FORMAT_SIMPLE_HUFFMAN_ALPHABET:-4,BROTLI_DECODER_ERROR_FORMAT_SIMPLE_HUFFMAN_SAME:-5,BROTLI_DECODER_ERROR_FORMAT_CL_SPACE:-6,BROTLI_DECODER_ERROR_FORMAT_HUFFMAN_SPACE:-7,BROTLI_DECODER_ERROR_FORMAT_CONTEXT_MAP_REPEAT:-8,BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_1:-9,BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_2:-10,BROTLI_DECODER_ERROR_FORMAT_TRANSFORM:-11,BROTLI_DECODER_ERROR_FORMAT_DICTIONARY:-12,BROTLI_DECODER_ERROR_FORMAT_WINDOW_BITS:-13,BROTLI_DECODER_ERROR_FORMAT_PADDING_1:-14,BROTLI_DECODER_ERROR_FORMAT_PADDING_2:-15,BROTLI_DECODER_ERROR_FORMAT_DISTANCE:-16,BROTLI_DECODER_ERROR_DICTIONARY_NOT_SET:-19,BROTLI_DECODER_ERROR_INVALID_ARGUMENTS:-20,BROTLI_DECODER_ERROR_ALLOC_CONTEXT_MODES:-21,BROTLI_DECODER_ERROR_ALLOC_TREE_GROUPS:-22,BROTLI_DECODER_ERROR_ALLOC_CONTEXT_MAP:-25,BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_1:-26,BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_2:-27,BROTLI_DECODER_ERROR_ALLOC_BLOCK_TYPE_TREES:-30,BROTLI_DECODER_ERROR_UNREACHABLE:-31},ta))});var Ps=d(f=>{"use strict";var ia=f&&f.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),sa=f&&f.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),ra=f&&f.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&ia(t,e,i[r]);return sa(t,e),t}})(),na=f&&f.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(f,"__esModule",{value:!0});f.ZstdDecompress=f.ZstdCompress=f.BrotliDecompress=f.BrotliCompress=f.Unzip=f.InflateRaw=f.DeflateRaw=f.Gunzip=f.Gzip=f.Inflate=f.Deflate=f.Zlib=f.ZlibError=f.constants=void 0;var _s=na(__nccwpck_require__(2613)),Ae=__nccwpck_require__(181),oa=We(),Hr=ra(__nccwpck_require__(3106)),te=ds(),aa=ds();Object.defineProperty(f,"constants",{enumerable:!0,get:function(){return aa.constants}});var ha=Ae.Buffer.concat,Gr=Object.getOwnPropertyDescriptor(Ae.Buffer,"concat"),la=s=>s,ms=Gr?.writable===!0||Gr?.set!==void 0?s=>{Ae.Buffer.concat=s?la:ha}:s=>{},Ie=Symbol("_superWrite"),Fe=class extends Error{code;errno;constructor(e,t){super("zlib: "+e.message,{cause:e}),this.code=e.code,this.errno=e.errno,this.code||(this.code="ZLIB_ERROR"),this.message="zlib: "+e.message,Error.captureStackTrace(this,t??this.constructor)}get name(){return"ZlibError"}};f.ZlibError=Fe;var ps=Symbol("flushFlag"),St=class extends oa.Minipass{#e=!1;#i=!1;#s;#n;#r;#t;#o;get sawError(){return this.#e}get handle(){return this.#t}get flushFlag(){return this.#s}constructor(e,t){if(!e||typeof e!="object")throw new TypeError("invalid options for ZlibBase constructor");if(super(e),this.#s=e.flush??0,this.#n=e.finishFlush??0,this.#r=e.fullFlushFlag??0,typeof Hr[t]!="function")throw new TypeError("Compression method not supported: "+t);try{this.#t=new Hr[t](e)}catch(i){throw new Fe(i,this.constructor)}this.#o=i=>{this.#e||(this.#e=!0,this.close(),this.emit("error",i))},this.#t?.on("error",i=>this.#o(new Fe(i))),this.once("end",()=>this.close)}close(){this.#t&&(this.#t.close(),this.#t=void 0,this.emit("close"))}reset(){if(!this.#e)return(0,_s.default)(this.#t,"zlib binding closed"),this.#t.reset?.()}flush(e){this.ended||(typeof e!="number"&&(e=this.#r),this.write(Object.assign(Ae.Buffer.alloc(0),{[ps]:e})))}end(e,t,i){return typeof e=="function"&&(i=e,t=void 0,e=void 0),typeof t=="function"&&(i=t,t=void 0),e&&(t?this.write(e,t):this.write(e)),this.flush(this.#n),this.#i=!0,super.end(i)}get ended(){return this.#i}[Ie](e){return super.write(e)}write(e,t,i){if(typeof t=="function"&&(i=t,t="utf8"),typeof e=="string"&&(e=Ae.Buffer.from(e,t)),this.#e)return;(0,_s.default)(this.#t,"zlib binding closed");let r=this.#t._handle,n=r.close;r.close=()=>{};let o=this.#t.close;this.#t.close=()=>{},ms(!0);let a;try{let l=typeof e[ps]=="number"?e[ps]:this.#s;a=this.#t._processChunk(e,l),ms(!1)}catch(l){ms(!1),this.#o(new Fe(l,this.write))}finally{this.#t&&(this.#t._handle=r,r.close=n,this.#t.close=o,this.#t.removeAllListeners("error"))}this.#t&&this.#t.on("error",l=>this.#o(new Fe(l,this.write)));let h;if(a)if(Array.isArray(a)&&a.length>0){let l=a[0];h=this[Ie](Ae.Buffer.from(l));for(let c=1;c<a.length;c++)h=this[Ie](a[c])}else h=this[Ie](Ae.Buffer.from(a));return i&&i(),h}},ie=class extends St{#e;#i;constructor(e,t){e=e||{},e.flush=e.flush||te.constants.Z_NO_FLUSH,e.finishFlush=e.finishFlush||te.constants.Z_FINISH,e.fullFlushFlag=te.constants.Z_FULL_FLUSH,super(e,t),this.#e=e.level,this.#i=e.strategy}params(e,t){if(!this.sawError){if(!this.handle)throw new Error("cannot switch params when binding is closed");if(!this.handle.params)throw new Error("not supported in this implementation");if(this.#e!==e||this.#i!==t){this.flush(te.constants.Z_SYNC_FLUSH),(0,_s.default)(this.handle,"zlib binding closed");let i=this.handle.flush;this.handle.flush=(r,n)=>{typeof r=="function"&&(n=r,r=this.flushFlag),this.flush(r),n?.()};try{this.handle.params(e,t)}finally{this.handle.flush=i}this.handle&&(this.#e=e,this.#i=t)}}}};f.Zlib=ie;var ws=class extends ie{constructor(e){super(e,"Deflate")}};f.Deflate=ws;var ys=class extends ie{constructor(e){super(e,"Inflate")}};f.Inflate=ys;var Es=class extends ie{#e;constructor(e){super(e,"Gzip"),this.#e=e&&!!e.portable}[Ie](e){return this.#e?(this.#e=!1,e[9]=255,super[Ie](e)):super[Ie](e)}};f.Gzip=Es;var bs=class extends ie{constructor(e){super(e,"Gunzip")}};f.Gunzip=bs;var Ss=class extends ie{constructor(e){super(e,"DeflateRaw")}};f.DeflateRaw=Ss;var gs=class extends ie{constructor(e){super(e,"InflateRaw")}};f.InflateRaw=gs;var Rs=class extends ie{constructor(e){super(e,"Unzip")}};f.Unzip=Rs;var ei=class extends St{constructor(e,t){e=e||{},e.flush=e.flush||te.constants.BROTLI_OPERATION_PROCESS,e.finishFlush=e.finishFlush||te.constants.BROTLI_OPERATION_FINISH,e.fullFlushFlag=te.constants.BROTLI_OPERATION_FLUSH,super(e,t)}},Os=class extends ei{constructor(e){super(e,"BrotliCompress")}};f.BrotliCompress=Os;var vs=class extends ei{constructor(e){super(e,"BrotliDecompress")}};f.BrotliDecompress=vs;var ti=class extends St{constructor(e,t){e=e||{},e.flush=e.flush||te.constants.ZSTD_e_continue,e.finishFlush=e.finishFlush||te.constants.ZSTD_e_end,e.fullFlushFlag=te.constants.ZSTD_e_flush,super(e,t)}},Ts=class extends ti{constructor(e){super(e,"ZstdCompress")}};f.ZstdCompress=Ts;var Ds=class extends ti{constructor(e){super(e,"ZstdDecompress")}};f.ZstdDecompress=Ds});var Kr=d(Xe=>{"use strict";Object.defineProperty(Xe,"__esModule",{value:!0});Xe.parse=Xe.encode=void 0;var ca=(s,e)=>{if(Number.isSafeInteger(s))s<0?fa(s,e):ua(s,e);else throw Error("cannot encode number outside of javascript safe integer range");return e};Xe.encode=ca;var ua=(s,e)=>{e[0]=128;for(var t=e.length;t>1;t--)e[t-1]=s&255,s=Math.floor(s/256)},fa=(s,e)=>{e[0]=255;var t=!1;s=s*-1;for(var i=e.length;i>1;i--){var r=s&255;s=Math.floor(s/256),t?e[i-1]=Zr(r):r===0?e[i-1]=0:(t=!0,e[i-1]=Yr(r))}},da=s=>{let e=s[0],t=e===128?pa(s.subarray(1,s.length)):e===255?ma(s):null;if(t===null)throw Error("invalid base256 encoding");if(!Number.isSafeInteger(t))throw Error("parsed number outside of javascript safe integer range");return t};Xe.parse=da;var ma=s=>{for(var e=s.length,t=0,i=!1,r=e-1;r>-1;r--){var n=Number(s[r]),o;i?o=Zr(n):n===0?o=n:(i=!0,o=Yr(n)),o!==0&&(t-=o*Math.pow(256,e-r-1))}return t},pa=s=>{for(var e=s.length,t=0,i=e-1;i>-1;i--){var r=Number(s[i]);r!==0&&(t+=r*Math.pow(256,e-i-1))}return t},Zr=s=>(255^s)&255,Yr=s=>(255^s)+1&255});var Ns=d(C=>{"use strict";Object.defineProperty(C,"__esModule",{value:!0});C.code=C.name=C.normalFsTypes=C.isName=C.isCode=void 0;var _a=s=>C.name.has(s);C.isCode=_a;var wa=s=>C.code.has(s);C.isName=wa;C.normalFsTypes=new Set(["0","","1","2","3","4","5","6","7","D"]);C.name=new Map([["0","File"],["","OldFile"],["1","Link"],["2","SymbolicLink"],["3","CharacterDevice"],["4","BlockDevice"],["5","Directory"],["6","FIFO"],["7","ContiguousFile"],["g","GlobalExtendedHeader"],["x","ExtendedHeader"],["A","SolarisACL"],["D","GNUDumpDir"],["I","Inode"],["K","NextFileHasLongLinkpath"],["L","NextFileHasLongPath"],["M","ContinuationFile"],["N","OldGnuLongPath"],["S","SparseFile"],["V","TapeVolumeHeader"],["X","OldExtendedHeader"]]);C.code=new Map(Array.from(C.name).map(s=>[s[1],s[0]]))});var et=d(se=>{"use strict";var ya=se&&se.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),Ea=se&&se.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),Vr=se&&se.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&ya(t,e,i[r]);return Ea(t,e),t}})();Object.defineProperty(se,"__esModule",{value:!0});se.Header=void 0;var Qe=__nccwpck_require__(6760),$r=Vr(Kr()),Je=Vr(Ns()),ba=s=>s===void 0||s<0?void 0:s,As=class{cksumValid=!1;needPax=!1;nullBlock=!1;block;path;mode;uid;gid;size;cksum;#e="Unsupported";linkpath;uname;gname;devmaj=0;devmin=0;atime;ctime;mtime;charset;comment;constructor(e,t=0,i,r){Buffer.isBuffer(e)?this.decode(e,t||0,i,r):e&&this.#i(e)}decode(e,t,i,r){if(t||(t=0),!e||!(e.length>=t+512))throw new Error("need 512 bytes for header");let n=Ce(e,t+156,1),o=Je.normalFsTypes.has(n),a=o?i:void 0,h=o?r:void 0;if(this.path=a?.path??Ce(e,t,100),this.mode=a?.mode??h?.mode??Se(e,t+100,8),this.uid=a?.uid??h?.uid??Se(e,t+108,8),this.gid=a?.gid??h?.gid??Se(e,t+116,8),this.size=ba(a?.size??h?.size??Se(e,t+124,12)),this.mtime=a?.mtime??h?.mtime??Ms(e,t+136,12),this.cksum=Se(e,t+148,12),h&&this.#i(h,!0),a&&this.#i(a),Je.isCode(n)&&(this.#e=n||"0"),this.#e==="0"&&this.path.slice(-1)==="/"&&(this.#e="5"),this.#e==="5"&&(this.size=0),this.linkpath=Ce(e,t+157,100),e.subarray(t+257,t+265).toString()==="ustar\x0000")if(this.uname=a?.uname??h?.uname??Ce(e,t+265,32),this.gname=a?.gname??h?.gname??Ce(e,t+297,32),this.devmaj=a?.devmaj??h?.devmaj??Se(e,t+329,8)??0,this.devmin=a?.devmin??h?.devmin??Se(e,t+337,8)??0,e[t+475]!==0){let c=Ce(e,t+345,155);this.path=c+"/"+this.path}else{let c=Ce(e,t+345,130);c&&(this.path=c+"/"+this.path),this.atime=i?.atime??r?.atime??Ms(e,t+476,12),this.ctime=i?.ctime??r?.ctime??Ms(e,t+488,12)}let l=256;for(let c=t;c<t+148;c++)l+=e[c];for(let c=t+156;c<t+512;c++)l+=e[c];this.cksumValid=l===this.cksum,this.cksum===void 0&&l===256&&(this.nullBlock=!0)}#i(e,t=!1){Object.assign(this,Object.fromEntries(Object.entries(e).filter(([i,r])=>!(r==null||i==="size"&&Number(r)<0||i==="path"&&t||i==="linkpath"&&t||i==="global"))))}encode(e,t=0){if(e||(e=this.block=Buffer.alloc(512)),this.#e==="Unsupported"&&(this.#e="0"),!(e.length>=t+512))throw new Error("need 512 bytes for header");let i=this.ctime||this.atime?130:155,r=Sa(this.path||"",i),n=r[0],o=r[1];this.needPax=!!r[2],this.needPax=Be(e,t,100,n)||this.needPax,this.needPax=ge(e,t+100,8,this.mode)||this.needPax,this.needPax=ge(e,t+108,8,this.uid)||this.needPax,this.needPax=ge(e,t+116,8,this.gid)||this.needPax,this.needPax=ge(e,t+124,12,this.size)||this.needPax,this.needPax=Ls(e,t+136,12,this.mtime)||this.needPax,e[t+156]=Number(this.#e.codePointAt(0)),this.needPax=Be(e,t+157,100,this.linkpath)||this.needPax,e.write("ustar\x0000",t+257,8),this.needPax=Be(e,t+265,32,this.uname)||this.needPax,this.needPax=Be(e,t+297,32,this.gname)||this.needPax,this.needPax=ge(e,t+329,8,this.devmaj)||this.needPax,this.needPax=ge(e,t+337,8,this.devmin)||this.needPax,this.needPax=Be(e,t+345,i,o)||this.needPax,e[t+475]!==0?this.needPax=Be(e,t+345,155,o)||this.needPax:(this.needPax=Be(e,t+345,130,o)||this.needPax,this.needPax=Ls(e,t+476,12,this.atime)||this.needPax,this.needPax=Ls(e,t+488,12,this.ctime)||this.needPax);let a=256;for(let h=t;h<t+148;h++)a+=e[h];for(let h=t+156;h<t+512;h++)a+=e[h];return this.cksum=a,ge(e,t+148,8,this.cksum),this.cksumValid=!0,this.needPax}get type(){return this.#e==="Unsupported"?this.#e:Je.name.get(this.#e)}get typeKey(){return this.#e}set type(e){let t=String(Je.code.get(e));if(Je.isCode(t)||t==="Unsupported")this.#e=t;else if(Je.isCode(e))this.#e=e;else throw new TypeError("invalid entry type: "+e)}};se.Header=As;var Sa=(s,e)=>{let i=s,r="",n,o=Qe.posix.parse(s).root||".";if(Buffer.byteLength(i)<100)n=[i,r,!1];else{r=Qe.posix.dirname(i),i=Qe.posix.basename(i);do Buffer.byteLength(i)<=100&&Buffer.byteLength(r)<=e?n=[i,r,!1]:Buffer.byteLength(i)>100&&Buffer.byteLength(r)<=e?n=[i.slice(0,99),r,!0]:(i=Qe.posix.join(Qe.posix.basename(r),i),r=Qe.posix.dirname(r));while(r!==o&&n===void 0);n||(n=[s.slice(0,99),"",!0])}return n},Ce=(s,e,t)=>s.subarray(e,e+t).toString("utf8").replace(/\0.*/,""),Ms=(s,e,t)=>ga(Se(s,e,t)),ga=s=>s===void 0?void 0:new Date(s*1e3),Se=(s,e,t)=>Number(s[e])&128?$r.parse(s.subarray(e,e+t)):Oa(s,e,t),Ra=s=>isNaN(s)?void 0:s,Oa=(s,e,t)=>Ra(parseInt(s.subarray(e,e+t).toString("utf8").replace(/\0.*$/,"").trim(),8)),va={12:8589934591,8:2097151},ge=(s,e,t,i)=>i===void 0?!1:i>va[t]||i<0?($r.encode(i,s.subarray(e,e+t)),!0):(Ta(s,e,t,i),!1),Ta=(s,e,t,i)=>s.write(Da(i,t),e,t,"ascii"),Da=(s,e)=>Pa(Math.floor(s).toString(8),e),Pa=(s,e)=>(s.length===e-1?s:new Array(e-s.length-1).join("0")+s+" ")+"\0",Ls=(s,e,t,i)=>i===void 0?!1:ge(s,e,t,i.getTime()/1e3),Na=new Array(156).join("\0"),Be=(s,e,t,i)=>i===void 0?!1:(s.write(i+Na,e,t,"utf8"),i.length!==Buffer.byteLength(i)||i.length>t)});var si=d(ii=>{"use strict";Object.defineProperty(ii,"__esModule",{value:!0});ii.Pax=void 0;var Ma=__nccwpck_require__(6760),La=et(),Is=class s{atime;mtime;ctime;charset;comment;gid;uid;gname;uname;linkpath;dev;ino;nlink;path;size;mode;global;constructor(e,t=!1){this.atime=e.atime,this.charset=e.charset,this.comment=e.comment,this.ctime=e.ctime,this.dev=e.dev,this.gid=e.gid,this.global=t,this.gname=e.gname,this.ino=e.ino,this.linkpath=e.linkpath,this.mtime=e.mtime,this.nlink=e.nlink,this.path=e.path,this.size=e.size,this.uid=e.uid,this.uname=e.uname}encode(){let e=this.encodeBody();if(e==="")return Buffer.allocUnsafe(0);let t=Buffer.byteLength(e),i=512*Math.ceil(1+t/512),r=Buffer.allocUnsafe(i);for(let n=0;n<512;n++)r[n]=0;new La.Header({path:("PaxHeader/"+(0,Ma.basename)(this.path??"")).slice(0,99),mode:this.mode||420,uid:this.uid,gid:this.gid,size:t,mtime:this.mtime,type:this.global?"GlobalExtendedHeader":"ExtendedHeader",linkpath:"",uname:this.uname||"",gname:this.gname||"",devmaj:0,devmin:0,atime:this.atime,ctime:this.ctime}).encode(r),r.write(e,512,t,"utf8");for(let n=t+512;n<r.length;n++)r[n]=0;return r}encodeBody(){return this.encodeField("path")+this.encodeField("ctime")+this.encodeField("atime")+this.encodeField("dev")+this.encodeField("ino")+this.encodeField("nlink")+this.encodeField("charset")+this.encodeField("comment")+this.encodeField("gid")+this.encodeField("gname")+this.encodeField("linkpath")+this.encodeField("mtime")+this.encodeField("size")+this.encodeField("uid")+this.encodeField("uname")}encodeField(e){if(this[e]===void 0)return"";let t=this[e],i=t instanceof Date?t.getTime()/1e3:t,r=" "+(e==="dev"||e==="ino"||e==="nlink"?"SCHILY.":"")+e+"="+i+`
+`,n=Buffer.byteLength(r),o=Math.floor(Math.log(n)/Math.log(10))+1;return n+o>=Math.pow(10,o)&&(o+=1),o+n+r}static parse(e,t,i=!1){return new s(Aa(Ia(e),t),i)}};ii.Pax=Is;var Aa=(s,e)=>e?Object.assign({},e,s):s,Ia=s=>s.replace(/\n$/,"").split(`
+`).reduce(Fa,Object.create(null)),Fa=(s,e)=>{let t=parseInt(e,10);if(t!==Buffer.byteLength(e)+1)return s;e=e.slice((t+" ").length);let i=e.split("="),r=i.shift();if(!r)return s;let n=r.replace(/^SCHILY\.(dev|ino|nlink)/,"$1"),o=i.join("=").replace(/\0.*/,"");switch(n){case"path":case"linkpath":case"type":case"charset":case"comment":case"gname":case"uname":s[n]=o;break;case"ctime":case"atime":case"mtime":s[n]=new Date(Number(o)*1e3);break;case"size":let a=+o;a>=0&&(s[n]=a);break;case"gid":case"uid":case"dev":case"ino":case"nlink":case"mode":s[n]=+o;break}return s}});var tt=d(ri=>{"use strict";Object.defineProperty(ri,"__esModule",{value:!0});ri.normalizeWindowsPath=void 0;var Ca=process.env.TESTING_TAR_FAKE_PLATFORM||process.platform;ri.normalizeWindowsPath=Ca!=="win32"?s=>String(s):s=>String(s).replaceAll(/\\/g,"/")});var Cs=d(oi=>{"use strict";Object.defineProperty(oi,"__esModule",{value:!0});oi.ReadEntry=void 0;var Ba=We(),ni=tt(),Fs=class extends Ba.Minipass{extended;globalExtended;header;startBlockSize;blockRemain;remain;type;meta=!1;ignore=!1;path;mode;uid;gid;uname;gname;size=0;mtime;atime;ctime;linkpath;dev;ino;nlink;invalid=!1;absolute;unsupported=!1;constructor(e,t,i){switch(super({}),this.pause(),this.extended=t,this.globalExtended=i,this.header=e,this.remain=e.size??0,this.startBlockSize=512*Math.ceil(this.remain/512),this.blockRemain=this.startBlockSize,this.type=e.type,this.type){case"File":case"OldFile":case"Link":case"SymbolicLink":case"CharacterDevice":case"BlockDevice":case"Directory":case"FIFO":case"ContiguousFile":case"GNUDumpDir":break;case"NextFileHasLongLinkpath":case"NextFileHasLongPath":case"OldGnuLongPath":case"GlobalExtendedHeader":case"ExtendedHeader":case"OldExtendedHeader":this.meta=!0;break;default:this.ignore=!0}if(!e.path)throw new Error("no path provided for tar.ReadEntry");this.path=(0,ni.normalizeWindowsPath)(e.path),this.mode=e.mode,this.mode&&(this.mode=this.mode&4095),this.uid=e.uid,this.gid=e.gid,this.uname=e.uname,this.gname=e.gname,this.size=this.remain,this.mtime=e.mtime,this.atime=e.atime,this.ctime=e.ctime,this.linkpath=e.linkpath?(0,ni.normalizeWindowsPath)(e.linkpath):void 0,this.uname=e.uname,this.gname=e.gname,t&&this.#e(t),i&&this.#e(i,!0)}write(e){let t=e.length;if(t>this.blockRemain)throw new Error("writing more to entry than is appropriate");let i=this.remain,r=this.blockRemain;return this.remain=Math.max(0,i-t),this.blockRemain=Math.max(0,r-t),this.ignore?!0:i>=t?super.write(e):super.write(e.subarray(0,i))}#e(e,t=!1){e.path&&(e.path=(0,ni.normalizeWindowsPath)(e.path)),e.linkpath&&(e.linkpath=(0,ni.normalizeWindowsPath)(e.linkpath)),Object.assign(this,Object.fromEntries(Object.entries(e).filter(([i,r])=>!(r==null||i==="path"&&t))))}};oi.ReadEntry=Fs});var hi=d(ai=>{"use strict";Object.defineProperty(ai,"__esModule",{value:!0});ai.warnMethod=void 0;var za=(s,e,t,i={})=>{s.file&&(i.file=s.file),s.cwd&&(i.cwd=s.cwd),i.code=t instanceof Error&&t.code||e,i.tarCode=e,!s.strict&&i.recoverable!==!1?(t instanceof Error&&(i=Object.assign(t,i),t=t.message),s.emit("warn",e,t,i)):t instanceof Error?s.emit("error",Object.assign(t,i)):s.emit("error",Object.assign(new Error(`${e}: ${t}`),i))};ai.warnMethod=za});var _i=d(pi=>{"use strict";Object.defineProperty(pi,"__esModule",{value:!0});pi.Parser=void 0;var ka=__nccwpck_require__(4434),Bs=Ps(),Xr=et(),Qr=si(),xa=Cs(),ja=hi(),Ua=1024*1024,qs=Buffer.from([31,139]),Ws=Buffer.from([40,181,47,253]),qa=Math.max(qs.length,Ws.length),H=Symbol("state"),ze=Symbol("writeEntry"),me=Symbol("readEntry"),zs=Symbol("nextEntry"),Jr=Symbol("processEntry"),re=Symbol("extendedHeader"),gt=Symbol("globalExtendedHeader"),Re=Symbol("meta"),en=Symbol("emitMeta"),_=Symbol("buffer"),pe=Symbol("queue"),Oe=Symbol("ended"),ks=Symbol("emittedEnd"),ke=Symbol("emit"),y=Symbol("unzip"),li=Symbol("consumeChunk"),ci=Symbol("consumeChunkSub"),xs=Symbol("consumeBody"),tn=Symbol("consumeMeta"),sn=Symbol("consumeHeader"),Rt=Symbol("consuming"),js=Symbol("bufferConcat"),ui=Symbol("maybeEnd"),it=Symbol("writing"),ne=Symbol("aborted"),fi=Symbol("onDone"),xe=Symbol("sawValidEntry"),di=Symbol("sawNullBlock"),mi=Symbol("sawEOF"),rn=Symbol("closeStream"),Wa=1e3,Ot=Symbol("compressedBytesRead"),Us=Symbol("decompressedBytesRead"),nn=Symbol("checkDecompressionRatio"),Ha=()=>!0,Hs=class extends ka.EventEmitter{file;strict;maxMetaEntrySize;filter;brotli;zstd;maxDecompressionRatio;writable=!0;readable=!1;[pe]=[];[_];[me];[ze];[H]="begin";[Re]="";[re];[gt];[Oe]=!1;[y];[ne]=!1;[xe];[di]=!1;[mi]=!1;[it]=!1;[Rt]=!1;[ks]=!1;[Ot]=0;[Us]=0;constructor(e={}){super(),this.file=e.file||"",this.on(fi,()=>{(this[H]==="begin"||this[xe]===!1)&&this.warn("TAR_BAD_ARCHIVE","Unrecognized archive format")}),e.ondone?this.on(fi,e.ondone):this.on(fi,()=>{this.emit("prefinish"),this.emit("finish"),this.emit("end")}),this.strict=!!e.strict,this.maxDecompressionRatio=typeof e.maxDecompressionRatio=="number"?e.maxDecompressionRatio:Wa,this.maxMetaEntrySize=e.maxMetaEntrySize||Ua,this.filter=typeof e.filter=="function"?e.filter:Ha;let t=e.file&&(e.file.endsWith(".tar.br")||e.file.endsWith(".tbr"));this.brotli=!(e.gzip||e.zstd)&&e.brotli!==void 0?e.brotli:t?void 0:!1;let i=e.file&&(e.file.endsWith(".tar.zst")||e.file.endsWith(".tzst"));this.zstd=!(e.gzip||e.brotli)&&e.zstd!==void 0?e.zstd:i?!0:void 0,this.on("end",()=>this[rn]()),typeof e.onwarn=="function"&&this.on("warn",e.onwarn),typeof e.onReadEntry=="function"&&this.on("entry",e.onReadEntry)}warn(e,t,i={}){(0,ja.warnMethod)(this,e,t,i)}[sn](e,t){this[xe]===void 0&&(this[xe]=!1);let i;try{i=new Xr.Header(e,t,this[re],this[gt])}catch(r){return this.warn("TAR_ENTRY_INVALID",r)}if(i.nullBlock)this[di]?(this[mi]=!0,this[H]==="begin"&&(this[H]="header"),this[ke]("eof")):(this[di]=!0,this[ke]("nullBlock"));else if(this[di]=!1,!i.cksumValid)this.warn("TAR_ENTRY_INVALID","checksum failure",{header:i});else if(!i.path)this.warn("TAR_ENTRY_INVALID","path is required",{header:i});else{let r=i.type;if(/^(Symbolic)?Link$/.test(r)&&!i.linkpath)this.warn("TAR_ENTRY_INVALID","linkpath required",{header:i});else if(!/^(Symbolic)?Link$/.test(r)&&!/^(Global)?ExtendedHeader$/.test(r)&&i.linkpath)this.warn("TAR_ENTRY_INVALID","linkpath forbidden",{header:i});else{let n=this[ze]=new xa.ReadEntry(i,this[re],this[gt]);if(!this[xe])if(n.remain){let o=()=>{n.invalid||(this[xe]=!0)};n.on("end",o)}else this[xe]=!0;n.meta?n.size>this.maxMetaEntrySize?(n.ignore=!0,this[ke]("ignoredEntry",n),this[H]="ignore",n.resume()):n.size>0&&(this[Re]="",n.on("data",o=>this[Re]+=o),this[H]="meta"):(this[re]=void 0,n.ignore=n.ignore||!this.filter(n.path,n),n.ignore?(this[ke]("ignoredEntry",n),this[H]=n.remain?"ignore":"header",n.resume()):(n.remain?this[H]="body":(this[H]="header",n.end()),this[me]?this[pe].push(n):(this[pe].push(n),this[zs]())))}}}[rn](){queueMicrotask(()=>this.emit("close"))}[Jr](e){let t=!0;if(!e)this[me]=void 0,t=!1;else if(Array.isArray(e)){let[i,...r]=e;this.emit(i,...r)}else this[me]=e,this.emit("entry",e),e.emittedEnd||(e.on("end",()=>this[zs]()),t=!1);return t}[zs](){do;while(this[Jr](this[pe].shift()));if(this[pe].length===0){let e=this[me];!e||e.flowing||e.size===e.remain?this[it]||this.emit("drain"):e.once("drain",()=>this.emit("drain"))}}[xs](e,t){let i=this[ze];if(!i)throw new Error("attempt to consume body without entry??");let r=i.blockRemain??0,n=r>=e.length&&t===0?e:e.subarray(t,t+r);return i.write(n),i.blockRemain||(this[H]="header",this[ze]=void 0,i.end()),n.length}[tn](e,t){let i=this[ze],r=this[xs](e,t);return!this[ze]&&i&&this[en](i),r}[ke](e,t,i){this[pe].length===0&&!this[me]?this.emit(e,t,i):this[pe].push([e,t,i])}[en](e){switch(this[ke]("meta",this[Re]),e.type){case"ExtendedHeader":case"OldExtendedHeader":this[re]=Qr.Pax.parse(this[Re],this[re],!1);break;case"GlobalExtendedHeader":this[gt]=Qr.Pax.parse(this[Re],this[gt],!0);break;case"NextFileHasLongPath":case"OldGnuLongPath":{let t=this[re]??Object.create(null);this[re]=t,t.path=this[Re].replace(/\0.*/,"");break}case"NextFileHasLongLinkpath":{let t=this[re]||Object.create(null);this[re]=t,t.linkpath=this[Re].replace(/\0.*/,"");break}default:throw new Error("unknown meta: "+e.type)}}abort(e){if(!this[ne]){if(this[y]){let t=this[y];t.write=()=>!0,t.end=()=>t,t.emit=()=>!1,t.destroy?.()}this[ne]=!0,this.emit("abort",e),this.warn("TAR_ABORT",e,{recoverable:!1})}}[nn](e){this[Us]+=e.length;let t=this[Us]/this[Ot];return t>this.maxDecompressionRatio?(this.abort(new Error(`max decompression ratio exceeded: ${t.toFixed(2)} > ${this.maxDecompressionRatio}`)),!1):!0}write(e,t,i){if(typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,typeof t=="string"?t:"utf8")),this[ne])return i?.(),!1;if((this[y]===void 0||this.brotli===void 0&&this[y]===!1)&&e){if(this[_]&&(e=Buffer.concat([this[_],e]),this[_]=void 0),e.length<qa)return this[_]=e,i?.(),!0;for(let h=0;this[y]===void 0&&h<qs.length;h++)e[h]!==qs[h]&&(this[y]=!1);let o=!1;if(this[y]===!1&&this.zstd!==!1){o=!0;for(let h=0;h<Ws.length;h++)if(e[h]!==Ws[h]){o=!1;break}}let a=this.brotli===void 0&&!o;if(this[y]===!1&&a)if(e.length<512)if(this[Oe])this.brotli=!0;else return this[_]=e,i?.(),!0;else try{new Xr.Header(e.subarray(0,512)),this.brotli=!1}catch{this.brotli=!0}if(this[y]===void 0||this[y]===!1&&(this.brotli||o)){let h=this[Oe];this[Oe]=!1,this[y]=this[y]===void 0?new Bs.Unzip({}):o?new Bs.ZstdDecompress({}):new Bs.BrotliDecompress({}),this[y].on("data",c=>{this[nn](c)&&this[li](c)}),this[y].on("error",c=>{this[ne]||this.abort(c)}),this[y].on("end",()=>{this[Oe]=!0,this[li]()}),this[it]=!0,this[Ot]+=e.length;let l=!!this[y][h?"end":"write"](e);return this[it]=!1,i?.(),l}}this[it]=!0,this[y]?(this[Ot]+=e.length,this[y].write(e)):this[li](e),this[it]=!1;let n=this[pe].length>0?!1:this[me]?this[me].flowing:!0;return!n&&this[pe].length===0&&this[me]?.once("drain",()=>this.emit("drain")),i?.(),n}[js](e){e&&!this[ne]&&(this[_]=this[_]?Buffer.concat([this[_],e]):e)}[ui](){if(this[Oe]&&!this[ks]&&!this[ne]&&!this[Rt]){this[ks]=!0;let e=this[ze];if(e?.blockRemain){let t=this[_]?this[_].length:0;this.warn("TAR_BAD_ARCHIVE",`Truncated input (needed ${e.blockRemain} more bytes, only ${t} available)`,{entry:e}),this[_]&&e.write(this[_]),e.end()}this[ke](fi)}}[li](e){if(this[Rt]&&e)this[js](e);else if(!e&&!this[_])this[ui]();else if(e){if(this[Rt]=!0,this[_]){this[js](e);let t=this[_];this[_]=void 0,this[ci](t)}else this[ci](e);for(;this[_]&&this[_]?.length>=512&&!this[ne]&&!this[mi];){let t=this[_];this[_]=void 0,this[ci](t)}this[Rt]=!1}(!this[_]||this[Oe])&&this[ui]()}[ci](e){let t=0,i=e.length;for(;t+512<=i&&!this[ne]&&!this[mi];)switch(this[H]){case"begin":case"header":this[sn](e,t),t+=512;break;case"ignore":case"body":t+=this[xs](e,t);break;case"meta":t+=this[tn](e,t);break;default:throw new Error("invalid state: "+this[H])}t<i&&(this[_]=this[_]?Buffer.concat([e.subarray(t),this[_]]):e.subarray(t))}end(e,t,i){return typeof e=="function"&&(i=e,t=void 0,e=void 0),typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,t)),i&&this.once("finish",i),this[ne]||(this[y]?(e&&(this[Ot]+=e.length,this[y].write(e)),this[y].end()):(this[Oe]=!0,(this.brotli===void 0||this.zstd===void 0)&&(e=e||Buffer.alloc(0)),e&&this.write(e),this[ui]())),this}};pi.Parser=Hs});var yi=d(wi=>{"use strict";Object.defineProperty(wi,"__esModule",{value:!0});wi.stripTrailingSlashes=void 0;var Ga=s=>{let e=s.length-1,t=-1;for(;e>-1&&s.charAt(e)==="/";)t=e,e--;return t===-1?s:s.slice(0,t)};wi.stripTrailingSlashes=Ga});var rt=d(B=>{"use strict";var Za=B&&B.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),Ya=B&&B.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),Ka=B&&B.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&Za(t,e,i[r]);return Ya(t,e),t}})(),Va=B&&B.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(B,"__esModule",{value:!0});B.list=B.filesFilter=void 0;var $a=Ka(Ke()),st=Va(__nccwpck_require__(3024)),on=__nccwpck_require__(6928),Xa=Ve(),Ei=_i(),Gs=yi(),Qa=s=>{let e=s.onReadEntry;s.onReadEntry=e?t=>{e(t),t.resume()}:t=>t.resume()},Ja=(s,e)=>{let t=new Map(e.map(o=>[(0,Gs.stripTrailingSlashes)(o),!0])),i=s.filter,r=100,n=(o,a="",h=0)=>{if(h>=r)return t.set(o,!1),!1;let l=a||(0,on.parse)(o).root||".",c;if(o===l)c=!1;else{let u=t.get(o);c=u!==void 0?u:n((0,on.dirname)(o),l,h+1)}return t.set(o,c),c};s.filter=i?(o,a)=>i(o,a)&&n((0,Gs.stripTrailingSlashes)(o)):o=>n((0,Gs.stripTrailingSlashes)(o))};B.filesFilter=Ja;var eh=s=>{let e=new Ei.Parser(s),t=s.file,i;try{i=st.default.openSync(t,"r");let r=st.default.fstatSync(i),n=s.maxReadSize||16*1024*1024;if(r.size<n){let o=Buffer.allocUnsafe(r.size),a=st.default.readSync(i,o,0,r.size,0);e.end(a===o.byteLength?o:o.subarray(0,a))}else{let o=0,a=Buffer.allocUnsafe(n);for(;o<r.size;){let h=st.default.readSync(i,a,0,n,o);if(h===0)break;o+=h,e.write(a.subarray(0,h))}e.end()}}finally{if(typeof i=="number")try{st.default.closeSync(i)}catch{}}},th=(s,e)=>{let t=new Ei.Parser(s),i=s.maxReadSize||16*1024*1024,r=s.file;return new Promise((o,a)=>{t.on("error",a),t.on("end",o),st.default.stat(r,(h,l)=>{if(h)a(h);else{let c=new $a.ReadStream(r,{readSize:i,size:l.size});c.on("error",a),c.pipe(t)}})})};B.list=(0,Xa.makeCommand)(eh,th,s=>new Ei.Parser(s),s=>new Ei.Parser(s),(s,e)=>{e?.length&&(0,B.filesFilter)(s,e),s.noResume||Qa(s)})});var an=d(bi=>{"use strict";Object.defineProperty(bi,"__esModule",{value:!0});bi.modeFix=void 0;var ih=(s,e,t)=>(s&=4095,t&&(s=(s|384)&-19),e&&(s&256&&(s|=64),s&32&&(s|=8),s&4&&(s|=1)),s);bi.modeFix=ih});var Zs=d(Si=>{"use strict";Object.defineProperty(Si,"__esModule",{value:!0});Si.stripAbsolutePath=void 0;var sh=__nccwpck_require__(6760),{isAbsolute:rh,parse:hn}=sh.win32,nh=s=>{let e="",t=hn(s);for(;rh(s)||t.root;){let i=s.charAt(0)==="/"&&s.slice(0,4)!=="//?/"?"/":t.root;s=s.slice(i.length),e+=i,t=hn(s)}return[e,s]};Si.stripAbsolutePath=nh});var Ks=d(nt=>{"use strict";Object.defineProperty(nt,"__esModule",{value:!0});nt.decode=nt.encode=void 0;var gi=["|","<",">","?",":"],Ys=gi.map(s=>String.fromCodePoint(61440+Number(s.codePointAt(0)))),oh=new Map(gi.map((s,e)=>[s,Ys[e]])),ah=new Map(Ys.map((s,e)=>[s,gi[e]])),hh=s=>gi.reduce((e,t)=>e.split(t).join(oh.get(t)),s);nt.encode=hh;var lh=s=>Ys.reduce((e,t)=>e.split(t).join(ah.get(t)),s);nt.decode=lh});var nr=d(M=>{"use strict";var ch=M&&M.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),uh=M&&M.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),fh=M&&M.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&ch(t,e,i[r]);return uh(t,e),t}})(),mn=M&&M.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(M,"__esModule",{value:!0});M.WriteEntryTar=M.WriteEntrySync=M.WriteEntry=void 0;var ae=mn(__nccwpck_require__(9896)),pn=We(),ln=mn(__nccwpck_require__(6928)),_n=et(),wn=an(),oe=tt(),yn=Qt(),En=si(),bn=Zs(),dh=yi(),Sn=hi(),mh=fh(Ks()),gn=(s,e)=>e?(s=(0,oe.normalizeWindowsPath)(s).replace(/^\.(\/|$)/,""),(0,dh.stripTrailingSlashes)(e)+"/"+s):(0,oe.normalizeWindowsPath)(s),ph=16*1024*1024,cn=Symbol("process"),un=Symbol("file"),fn=Symbol("directory"),$s=Symbol("symlink"),dn=Symbol("hardlink"),vt=Symbol("header"),Ri=Symbol("read"),Xs=Symbol("lstat"),Oi=Symbol("onlstat"),Qs=Symbol("onread"),Js=Symbol("onreadlink"),er=Symbol("openfile"),tr=Symbol("onopenfile"),ve=Symbol("close"),vi=Symbol("mode"),ir=Symbol("awaitDrain"),Vs=Symbol("ondrain"),he=Symbol("prefix"),Ti=class extends pn.Minipass{path;portable;myuid=process.getuid&&process.getuid()||0;myuser=process.env.USER||"";maxReadSize;linkCache;statCache;preservePaths;cwd;strict;mtime;noPax;noMtime;prefix;fd;blockLen=0;blockRemain=0;buf;pos=0;remain=0;length=0;offset=0;win32;absolute;header;type;linkpath;stat;onWriteEntry;#e=!1;constructor(e,t={}){let i=(0,yn.dealias)(t);super(),this.path=(0,oe.normalizeWindowsPath)(e),this.portable=!!i.portable,this.maxReadSize=i.maxReadSize||ph,this.linkCache=i.linkCache||new Map,this.statCache=i.statCache||new Map,this.preservePaths=!!i.preservePaths,this.cwd=(0,oe.normalizeWindowsPath)(i.cwd||process.cwd()),this.strict=!!i.strict,this.noPax=!!i.noPax,this.noMtime=!!i.noMtime,this.mtime=i.mtime,this.prefix=i.prefix?(0,oe.normalizeWindowsPath)(i.prefix):void 0,this.onWriteEntry=i.onWriteEntry,typeof i.onwarn=="function"&&this.on("warn",i.onwarn);let r=!1;if(!this.preservePaths){let[o,a]=(0,bn.stripAbsolutePath)(this.path);o&&typeof a=="string"&&(this.path=a,r=o)}this.win32=!!i.win32||process.platform==="win32",this.win32&&(this.path=mh.decode(this.path.replaceAll(/\\/g,"/")),e=e.replaceAll(/\\/g,"/")),this.absolute=(0,oe.normalizeWindowsPath)(i.absolute||ln.default.resolve(this.cwd,e)),this.path===""&&(this.path="./"),r&&this.warn("TAR_ENTRY_INFO",`stripping ${r} from absolute path`,{entry:this,path:r+this.path});let n=this.statCache.get(this.absolute);n?this[Oi](n):this[Xs]()}warn(e,t,i={}){return(0,Sn.warnMethod)(this,e,t,i)}emit(e,...t){return e==="error"&&(this.#e=!0),super.emit(e,...t)}[Xs](){ae.default.lstat(this.absolute,(e,t)=>{if(e)return this.emit("error",e);this[Oi](t)})}[Oi](e){this.statCache.set(this.absolute,e),this.stat=e,e.isFile()||(e.size=0),this.type=_h(e),this.emit("stat",e),this[cn]()}[cn](){switch(this.type){case"File":return this[un]();case"Directory":return this[fn]();case"SymbolicLink":return this[$s]();default:return this.end()}}[vi](e){return(0,wn.modeFix)(e,this.type==="Directory",this.portable)}[he](e){return gn(e,this.prefix)}[vt](){if(!this.stat)throw new Error("cannot write header before stat");this.type==="Directory"&&this.portable&&(this.noMtime=!0),this.onWriteEntry?.(this),this.header=new _n.Header({path:this[he](this.path),linkpath:this.type==="Link"&&this.linkpath!==void 0?this[he](this.linkpath):this.linkpath,mode:this[vi](this.stat.mode),uid:this.portable?void 0:this.stat.uid,gid:this.portable?void 0:this.stat.gid,size:this.stat.size,mtime:this.noMtime?void 0:this.mtime||this.stat.mtime,type:this.type==="Unsupported"?void 0:this.type,uname:this.portable?void 0:this.stat.uid===this.myuid?this.myuser:"",atime:this.portable?void 0:this.stat.atime,ctime:this.portable?void 0:this.stat.ctime}),this.header.encode()&&!this.noPax&&super.write(new En.Pax({atime:this.portable?void 0:this.header.atime,ctime:this.portable?void 0:this.header.ctime,gid:this.portable?void 0:this.header.gid,mtime:this.noMtime?void 0:this.mtime||this.header.mtime,path:this[he](this.path),linkpath:this.type==="Link"&&this.linkpath!==void 0?this[he](this.linkpath):this.linkpath,size:this.header.size,uid:this.portable?void 0:this.header.uid,uname:this.portable?void 0:this.header.uname,dev:this.portable?void 0:this.stat.dev,ino:this.portable?void 0:this.stat.ino,nlink:this.portable?void 0:this.stat.nlink}).encode());let e=this.header?.block;if(!e)throw new Error("failed to encode header");super.write(e)}[fn](){if(!this.stat)throw new Error("cannot create directory entry without stat");this.path.slice(-1)!=="/"&&(this.path+="/"),this.stat.size=0,this[vt](),this.end()}[$s](){ae.default.readlink(this.absolute,(e,t)=>{if(e)return this.emit("error",e);this[Js](t)})}[Js](e){this.linkpath=(0,oe.normalizeWindowsPath)(e),this[vt](),this.end()}[dn](e){if(!this.stat)throw new Error("cannot create link entry without stat");this.type="Link",this.linkpath=(0,oe.normalizeWindowsPath)(ln.default.relative(this.cwd,e)),this.stat.size=0,this[vt](),this.end()}[un](){if(!this.stat)throw new Error("cannot create file entry without stat");if(this.stat.nlink>1){let e=`${this.stat.dev}:${this.stat.ino}`,t=this.linkCache.get(e);if(t?.indexOf(this.cwd)===0)return this[dn](t);this.linkCache.set(e,this.absolute)}if(this[vt](),this.stat.size===0)return this.end();this[er]()}[er](){ae.default.open(this.absolute,"r",(e,t)=>{if(e)return this.emit("error",e);this[tr](t)})}[tr](e){if(this.fd=e,this.#e)return this[ve]();if(!this.stat)throw new Error("should stat before calling onopenfile");this.blockLen=512*Math.ceil(this.stat.size/512),this.blockRemain=this.blockLen;let t=Math.min(this.blockLen,this.maxReadSize);this.buf=Buffer.allocUnsafe(t),this.offset=0,this.pos=0,this.remain=this.stat.size,this.length=this.buf.length,this[Ri]()}[Ri](){let{fd:e,buf:t,offset:i,length:r,pos:n}=this;if(e===void 0||t===void 0)throw new Error("cannot read file without first opening");ae.default.read(e,t,i,r,n,(o,a)=>{if(o)return this[ve](()=>this.emit("error",o));this[Qs](a)})}[ve](e=()=>{}){this.fd!==void 0&&ae.default.close(this.fd,e)}[Qs](e){if(e<=0&&this.remain>0){let r=Object.assign(new Error("encountered unexpected EOF"),{path:this.absolute,syscall:"read",code:"EOF"});return this[ve](()=>this.emit("error",r))}if(e>this.remain){let r=Object.assign(new Error("did not encounter expected EOF"),{path:this.absolute,syscall:"read",code:"EOF"});return this[ve](()=>this.emit("error",r))}if(!this.buf)throw new Error("should have created buffer prior to reading");if(e===this.remain)for(let r=e;r<this.length&&e<this.blockRemain;r++)this.buf[r+this.offset]=0,e++,this.remain++;let t=this.offset===0&&e===this.buf.length?this.buf:this.buf.subarray(this.offset,this.offset+e);this.write(t)?this[Vs]():this[ir](()=>this[Vs]())}[ir](e){this.once("drain",e)}write(e,t,i){if(typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,typeof t=="string"?t:"utf8")),this.blockRemain<e.length){let r=Object.assign(new Error("writing more data than expected"),{path:this.absolute});return this.emit("error",r)}return this.remain-=e.length,this.blockRemain-=e.length,this.pos+=e.length,this.offset+=e.length,super.write(e,null,i)}[Vs](){if(!this.remain)return this.blockRemain&&super.write(Buffer.alloc(this.blockRemain)),this[ve](e=>e?this.emit("error",e):this.end());if(!this.buf)throw new Error("buffer lost somehow in ONDRAIN");this.offset>=this.length&&(this.buf=Buffer.allocUnsafe(Math.min(this.blockRemain,this.buf.length)),this.offset=0),this.length=this.buf.length-this.offset,this[Ri]()}};M.WriteEntry=Ti;var sr=class extends Ti{sync=!0;[Xs](){this[Oi](ae.default.lstatSync(this.absolute))}[$s](){this[Js](ae.default.readlinkSync(this.absolute))}[er](){this[tr](ae.default.openSync(this.absolute,"r"))}[Ri](){let e=!0;try{let{fd:t,buf:i,offset:r,length:n,pos:o}=this;if(t===void 0||i===void 0)throw new Error("fd and buf must be set in READ method");let a=ae.default.readSync(t,i,r,n,o);this[Qs](a),e=!1}finally{if(e)try{this[ve](()=>{})}catch{}}}[ir](e){e()}[ve](e=()=>{}){this.fd!==void 0&&ae.default.closeSync(this.fd),e()}};M.WriteEntrySync=sr;var rr=class extends pn.Minipass{blockLen=0;blockRemain=0;buf=0;pos=0;remain=0;length=0;preservePaths;portable;strict;noPax;noMtime;readEntry;type;prefix;path;mode;uid;gid;uname;gname;header;mtime;atime;ctime;linkpath;size;onWriteEntry;warn(e,t,i={}){return(0,Sn.warnMethod)(this,e,t,i)}constructor(e,t={}){let i=(0,yn.dealias)(t);super(),this.preservePaths=!!i.preservePaths,this.portable=!!i.portable,this.strict=!!i.strict,this.noPax=!!i.noPax,this.noMtime=!!i.noMtime,this.onWriteEntry=i.onWriteEntry,this.readEntry=e;let{type:r}=e;if(r==="Unsupported")throw new Error("writing entry that should be ignored");this.type=r,this.type==="Directory"&&this.portable&&(this.noMtime=!0),this.prefix=i.prefix,this.path=(0,oe.normalizeWindowsPath)(e.path),this.mode=e.mode!==void 0?this[vi](e.mode):void 0,this.uid=this.portable?void 0:e.uid,this.gid=this.portable?void 0:e.gid,this.uname=this.portable?void 0:e.uname,this.gname=this.portable?void 0:e.gname,this.size=e.size,this.mtime=this.noMtime?void 0:i.mtime||e.mtime,this.atime=this.portable?void 0:e.atime,this.ctime=this.portable?void 0:e.ctime,this.linkpath=e.linkpath!==void 0?(0,oe.normalizeWindowsPath)(e.linkpath):void 0,typeof i.onwarn=="function"&&this.on("warn",i.onwarn);let n=!1;if(!this.preservePaths){let[a,h]=(0,bn.stripAbsolutePath)(this.path);a&&typeof h=="string"&&(this.path=h,n=a)}this.remain=e.size,this.blockRemain=e.startBlockSize,this.onWriteEntry?.(this),this.header=new _n.Header({path:this[he](this.path),linkpath:this.type==="Link"&&this.linkpath!==void 0?this[he](this.linkpath):this.linkpath,mode:this.mode,uid:this.portable?void 0:this.uid,gid:this.portable?void 0:this.gid,size:this.size,mtime:this.noMtime?void 0:this.mtime,type:this.type,uname:this.portable?void 0:this.uname,atime:this.portable?void 0:this.atime,ctime:this.portable?void 0:this.ctime}),n&&this.warn("TAR_ENTRY_INFO",`stripping ${n} from absolute path`,{entry:this,path:n+this.path}),this.header.encode()&&!this.noPax&&super.write(new En.Pax({atime:this.portable?void 0:this.atime,ctime:this.portable?void 0:this.ctime,gid:this.portable?void 0:this.gid,mtime:this.noMtime?void 0:this.mtime,path:this[he](this.path),linkpath:this.type==="Link"&&this.linkpath!==void 0?this[he](this.linkpath):this.linkpath,size:this.size,uid:this.portable?void 0:this.uid,uname:this.portable?void 0:this.uname,dev:this.portable?void 0:this.readEntry.dev,ino:this.portable?void 0:this.readEntry.ino,nlink:this.portable?void 0:this.readEntry.nlink}).encode());let o=this.header?.block;if(!o)throw new Error("failed to encode header");super.write(o),e.pipe(this)}[he](e){return gn(e,this.prefix)}[vi](e){return(0,wn.modeFix)(e,this.type==="Directory",this.portable)}write(e,t,i){typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,typeof t=="string"?t:"utf8"));let r=e.length;if(r>this.blockRemain)throw new Error("writing more to entry than is appropriate");return this.blockRemain-=r,super.write(e,i)}end(e,t,i){return this.blockRemain&&super.write(Buffer.alloc(this.blockRemain)),typeof e=="function"&&(i=e,t=void 0,e=void 0),typeof t=="function"&&(i=t,t=void 0),typeof e=="string"&&(e=Buffer.from(e,t??"utf8")),i&&this.once("finish",i),e?super.end(e,i):super.end(i),this}};M.WriteEntryTar=rr;var _h=s=>s.isFile()?"File":s.isDirectory()?"Directory":s.isSymbolicLink()?"SymbolicLink":"Unsupported"});var Rn=d(at=>{"use strict";Object.defineProperty(at,"__esModule",{value:!0});at.Node=at.Yallist=void 0;var or=class s{tail;head;length=0;static create(e=[]){return new s(e)}constructor(e=[]){for(let t of e)this.push(t)}*[Symbol.iterator](){for(let e=this.head;e;e=e.next)yield e.value}removeNode(e){if(e.list!==this)throw new Error("removing node which does not belong to this list");let t=e.next,i=e.prev;return t&&(t.prev=i),i&&(i.next=t),e===this.head&&(this.head=t),e===this.tail&&(this.tail=i),this.length--,e.next=void 0,e.prev=void 0,e.list=void 0,t}unshiftNode(e){if(e===this.head)return;e.list&&e.list.removeNode(e);let t=this.head;e.list=this,e.next=t,t&&(t.prev=e),this.head=e,this.tail||(this.tail=e),this.length++}pushNode(e){if(e===this.tail)return;e.list&&e.list.removeNode(e);let t=this.tail;e.list=this,e.prev=t,t&&(t.next=e),this.tail=e,this.head||(this.head=e),this.length++}push(...e){for(let t=0,i=e.length;t<i;t++)yh(this,e[t]);return this.length}unshift(...e){for(var t=0,i=e.length;t<i;t++)Eh(this,e[t]);return this.length}pop(){if(!this.tail)return;let e=this.tail.value,t=this.tail;return this.tail=this.tail.prev,this.tail?this.tail.next=void 0:this.head=void 0,t.list=void 0,this.length--,e}shift(){if(!this.head)return;let e=this.head.value,t=this.head;return this.head=this.head.next,this.head?this.head.prev=void 0:this.tail=void 0,t.list=void 0,this.length--,e}forEach(e,t){t=t||this;for(let i=this.head,r=0;i;r++)e.call(t,i.value,r,this),i=i.next}forEachReverse(e,t){t=t||this;for(let i=this.tail,r=this.length-1;i;r--)e.call(t,i.value,r,this),i=i.prev}get(e){let t=0,i=this.head;for(;i&&t<e;t++)i=i.next;if(t===e&&i)return i.value}getReverse(e){let t=0,i=this.tail;for(;i&&t<e;t++)i=i.prev;if(t===e&&i)return i.value}map(e,t){t=t||this;let i=new s;for(let r=this.head;r;)i.push(e.call(t,r.value,this)),r=r.next;return i}mapReverse(e,t){t=t||this;var i=new s;for(let r=this.tail;r;)i.push(e.call(t,r.value,this)),r=r.prev;return i}reduce(e,t){let i,r=this.head;if(arguments.length>1)i=t;else if(this.head)r=this.head.next,i=this.head.value;else throw new TypeError("Reduce of empty list with no initial value");for(var n=0;r;n++)i=e(i,r.value,n),r=r.next;return i}reduceReverse(e,t){let i,r=this.tail;if(arguments.length>1)i=t;else if(this.tail)r=this.tail.prev,i=this.tail.value;else throw new TypeError("Reduce of empty list with no initial value");for(let n=this.length-1;r;n--)i=e(i,r.value,n),r=r.prev;return i}toArray(){let e=new Array(this.length);for(let t=0,i=this.head;i;t++)e[t]=i.value,i=i.next;return e}toArrayReverse(){let e=new Array(this.length);for(let t=0,i=this.tail;i;t++)e[t]=i.value,i=i.prev;return e}slice(e=0,t=this.length){t<0&&(t+=this.length),e<0&&(e+=this.length);let i=new s;if(t<e||t<0)return i;e<0&&(e=0),t>this.length&&(t=this.length);let r=this.head,n=0;for(n=0;r&&n<e;n++)r=r.next;for(;r&&n<t;n++,r=r.next)i.push(r.value);return i}sliceReverse(e=0,t=this.length){t<0&&(t+=this.length),e<0&&(e+=this.length);let i=new s;if(t<e||t<0)return i;e<0&&(e=0),t>this.length&&(t=this.length);let r=this.length,n=this.tail;for(;n&&r>t;r--)n=n.prev;for(;n&&r>e;r--,n=n.prev)i.push(n.value);return i}splice(e,t=0,...i){e>this.length&&(e=this.length-1),e<0&&(e=this.length+e);let r=this.head;for(let o=0;r&&o<e;o++)r=r.next;let n=[];for(let o=0;r&&o<t;o++)n.push(r.value),r=this.removeNode(r);r?r!==this.tail&&(r=r.prev):r=this.tail;for(let o of i)r=wh(this,r,o);return n}reverse(){let e=this.head,t=this.tail;for(let i=e;i;i=i.prev){let r=i.prev;i.prev=i.next,i.next=r}return this.head=t,this.tail=e,this}};at.Yallist=or;function wh(s,e,t){let i=e,r=e?e.next:s.head,n=new ot(t,i,r,s);return n.next===void 0&&(s.tail=n),n.prev===void 0&&(s.head=n),s.length++,n}function yh(s,e){s.tail=new ot(e,s.tail,void 0,s),s.head||(s.head=s.tail),s.length++}function Eh(s,e){s.head=new ot(e,void 0,s.head,s),s.tail||(s.tail=s.head),s.length++}var ot=class{list;next;prev;value;constructor(e,t,i,r){this.list=r,this.value=e,t?(t.next=this,this.prev=t):this.prev=void 0,i?(i.prev=this,this.next=i):this.next=void 0}};at.Node=ot});var Ci=d(L=>{"use strict";var bh=L&&L.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),Sh=L&&L.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),gh=L&&L.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&bh(t,e,i[r]);return Sh(t,e),t}})(),Pn=L&&L.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(L,"__esModule",{value:!0});L.PackSync=L.Pack=L.PackJob=void 0;var Ii=Pn(__nccwpck_require__(9896)),fr=nr(),Nt=class{path;absolute;entry;stat;readdir;pending=!1;pendingLink=!1;ignore=!1;piped=!1;constructor(e,t){this.path=e||"./",this.absolute=t}};L.PackJob=Nt;var Rh=We(),ar=gh(Ps()),Oh=Rn(),vh=hi(),On=Buffer.alloc(1024),Pi=Symbol("onStat"),Tt=Symbol("ended"),X=Symbol("queue"),Dt=Symbol("pendingLinks"),Te=Symbol("current"),je=Symbol("process"),Pt=Symbol("processing"),Di=Symbol("processJob"),Q=Symbol("jobs"),hr=Symbol("jobDone"),Ni=Symbol("addFSEntry"),vn=Symbol("addTarEntry"),dr=Symbol("stat"),mr=Symbol("readdir"),Mi=Symbol("onreaddir"),Li=Symbol("pipe"),Tn=Symbol("entry"),lr=Symbol("entryOpt"),Ai=Symbol("writeEntryClass"),Nn=Symbol("write"),cr=Symbol("ondrain"),Dn=Pn(__nccwpck_require__(6928)),ur=tt(),Fi=class extends Rh.Minipass{sync=!1;opt;cwd;maxReadSize;preservePaths;strict;noPax;prefix;linkCache;statCache;file;portable;zip;readdirCache;noDirRecurse;follow;noMtime;mtime;filter;jobs;[Ai];onWriteEntry;[X];[Dt]=new Map;[Q]=0;[Pt]=!1;[Tt]=!1;constructor(e={}){if(super(),this.opt=e,this.file=e.file||"",this.cwd=e.cwd||process.cwd(),this.maxReadSize=e.maxReadSize,this.preservePaths=!!e.preservePaths,this.strict=!!e.strict,this.noPax=!!e.noPax,this.prefix=(0,ur.normalizeWindowsPath)(e.prefix||""),this.linkCache=e.linkCache||new Map,this.statCache=e.statCache||new Map,this.readdirCache=e.readdirCache||new Map,this.onWriteEntry=e.onWriteEntry,this[Ai]=fr.WriteEntry,typeof e.onwarn=="function"&&this.on("warn",e.onwarn),this.portable=!!e.portable,e.gzip||e.brotli||e.zstd){if((e.gzip?1:0)+(e.brotli?1:0)+(e.zstd?1:0)>1)throw new TypeError("gzip, brotli, zstd are mutually exclusive");if(e.gzip&&(typeof e.gzip!="object"&&(e.gzip={}),this.portable&&(e.gzip.portable=!0),this.zip=new ar.Gzip(e.gzip)),e.brotli&&(typeof e.brotli!="object"&&(e.brotli={}),this.zip=new ar.BrotliCompress(e.brotli)),e.zstd&&(typeof e.zstd!="object"&&(e.zstd={}),this.zip=new ar.ZstdCompress(e.zstd)),!this.zip)throw new Error("impossible");let t=this.zip;t.on("data",i=>super.write(i)),t.on("end",()=>super.end()),t.on("drain",()=>this[cr]()),this.on("resume",()=>t.resume())}else this.on("drain",this[cr]);this.noDirRecurse=!!e.noDirRecurse,this.follow=!!e.follow,this.noMtime=!!e.noMtime,e.mtime&&(this.mtime=e.mtime),this.filter=typeof e.filter=="function"?e.filter:()=>!0,this[X]=new Oh.Yallist,this[Q]=0,this.jobs=Number(e.jobs)||4,this[Pt]=!1,this[Tt]=!1}[Nn](e){return super.write(e)}add(e){return this.write(e),this}end(e,t,i){return typeof e=="function"&&(i=e,e=void 0),typeof t=="function"&&(i=t,t=void 0),e&&this.add(e),this[Tt]=!0,this[je](),i&&i(),this}write(e){if(this[Tt])throw new Error("write after end");return typeof e=="string"?this[Ni](e):this[vn](e),this.flowing}[vn](e){let t=(0,ur.normalizeWindowsPath)(Dn.default.resolve(this.cwd,e.path));if(!this.filter(e.path,e))e.resume();else{let i=new Nt(e.path,t);i.entry=new fr.WriteEntryTar(e,this[lr](i)),i.entry.on("end",()=>this[hr](i)),this[Q]+=1,this[X].push(i)}this[je]()}[Ni](e){let t=(0,ur.normalizeWindowsPath)(Dn.default.resolve(this.cwd,e));this[X].push(new Nt(e,t)),this[je]()}[dr](e){e.pending=!0,this[Q]+=1;let t=this.follow?"stat":"lstat";Ii.default[t](e.absolute,(i,r)=>{e.pending=!1,this[Q]-=1,i?this.emit("error",i):this[Pi](e,r)})}[Pi](e,t){if(this.statCache.set(e.absolute,t),e.stat=t,!this.filter(e.path,t))e.ignore=!0;else if(t.isFile()&&t.nlink>1&&!this.linkCache.get(`${t.dev}:${t.ino}`)&&!this.sync)if(e===this[Te])this[Di](e);else{let i=`${t.dev}:${t.ino}`,r=this[Dt].get(i);r?r.push(e):this[Dt].set(i,[e]),e.pendingLink=!0,e.pending=!0}this[je]()}[mr](e){e.pending=!0,this[Q]+=1,Ii.default.readdir(e.absolute,(t,i)=>{if(e.pending=!1,this[Q]-=1,t)return this.emit("error",t);this[Mi](e,i)})}[Mi](e,t){this.readdirCache.set(e.absolute,t),e.readdir=t,this[je]()}[je](){if(!this[Pt]){this[Pt]=!0;for(let e=this[X].head;e&&this[Q]<this.jobs;e=e.next)if(this[Di](e.value),e.value.ignore){let t=e.next;this[X].removeNode(e),e.next=t}this[Pt]=!1,this[Tt]&&this[X].length===0&&this[Q]===0&&(this.zip?this.zip.end(On):(super.write(On),super.end()))}}get[Te](){return this[X]&&this[X].head&&this[X].head.value}[hr](e){this[X].shift(),this[Q]-=1;let{stat:t}=e;if(t&&t.isFile()&&t.nlink>1){let i=`${t.dev}:${t.ino}`,r=this[Dt].get(i);if(r){this[Dt].delete(i);for(let n of r)n.pending=!1,this[Di](n)}}this[je]()}[Di](e){if(e.pending&&e.pendingLink&&e===this[Te]&&(e.pending=!1,e.pendingLink=!1),!e.pending){if(e.entry){e===this[Te]&&!e.piped&&this[Li](e);return}if(!e.stat){let t=this.statCache.get(e.absolute);t?this[Pi](e,t):this[dr](e)}if(e.stat&&!e.ignore){if(!this.noDirRecurse&&e.stat.isDirectory()&&!e.readdir){let t=this.readdirCache.get(e.absolute);if(t?this[Mi](e,t):this[mr](e),!e.readdir)return}if(e.entry=this[Tn](e),!e.entry){e.ignore=!0;return}e===this[Te]&&!e.piped&&this[Li](e)}}}[lr](e){return{onwarn:(t,i,r)=>this.warn(t,i,r),noPax:this.noPax,cwd:this.cwd,absolute:e.absolute,preservePaths:this.preservePaths,maxReadSize:this.maxReadSize,strict:this.strict,portable:this.portable,linkCache:this.linkCache,statCache:this.statCache,noMtime:this.noMtime,mtime:this.mtime,prefix:this.prefix,onWriteEntry:this.onWriteEntry}}[Tn](e){this[Q]+=1;try{return new this[Ai](e.path,this[lr](e)).on("end",()=>this[hr](e)).on("error",i=>this.emit("error",i))}catch(t){this.emit("error",t)}}[cr](){this[Te]&&this[Te].entry&&this[Te].entry.resume()}[Li](e){e.piped=!0,e.readdir&&e.readdir.forEach(r=>{let n=e.path,o=n==="./"?"":n.replace(/\/*$/,"/");this[Ni](o+r)});let t=e.entry,i=this.zip;if(!t)throw new Error("cannot pipe without source");i?t.on("data",r=>{i.write(r)||t.pause()}):t.on("data",r=>{super.write(r)||t.pause()})}pause(){return this.zip&&this.zip.pause(),super.pause()}warn(e,t,i={}){(0,vh.warnMethod)(this,e,t,i)}};L.Pack=Fi;var pr=class extends Fi{sync=!0;constructor(e){super(e),this[Ai]=fr.WriteEntrySync}pause(){}resume(){}[dr](e){let t=this.follow?"statSync":"lstatSync";this[Pi](e,Ii.default[t](e.absolute))}[mr](e){this[Mi](e,Ii.default.readdirSync(e.absolute))}[Li](e){let t=e.entry,i=this.zip;if(e.readdir&&e.readdir.forEach(r=>{let n=e.path,o=n==="./"?"":n.replace(/\/*$/,"/");this[Ni](o+r)}),!t)throw new Error("Cannot pipe without source");i?t.on("data",r=>{i.write(r)}):t.on("data",r=>{super[Nn](r)})}};L.PackSync=pr});var _r=d(ht=>{"use strict";var Th=ht&&ht.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(ht,"__esModule",{value:!0});ht.create=void 0;var Mn=Ke(),Ln=Th(__nccwpck_require__(6760)),An=rt(),Dh=Ve(),Bi=Ci(),Ph=(s,e)=>{let t=new Bi.PackSync(s),i=new Mn.WriteStreamSync(s.file,{mode:s.mode||438});t.pipe(i),In(t,e)},Nh=(s,e)=>{let t=new Bi.Pack(s),i=new Mn.WriteStream(s.file,{mode:s.mode||438});t.pipe(i);let r=new Promise((n,o)=>{i.on("error",o),i.on("close",n),t.on("error",o)});return Fn(t,e).catch(n=>t.emit("error",n)),r},In=(s,e)=>{e.forEach(t=>{t.charAt(0)==="@"?(0,An.list)({file:Ln.default.resolve(s.cwd,t.slice(1)),sync:!0,noResume:!0,onReadEntry:i=>s.add(i)}):s.add(t)}),s.end()},Fn=async(s,e)=>{for(let t of e)t.charAt(0)==="@"?await(0,An.list)({file:Ln.default.resolve(String(s.cwd),t.slice(1)),noResume:!0,onReadEntry:i=>{s.add(i)}}):s.add(t);s.end()},Mh=(s,e)=>{let t=new Bi.PackSync(s);return In(t,e),t},Lh=(s,e)=>{let t=new Bi.Pack(s);return Fn(t,e).catch(i=>t.emit("error",i)),t};ht.create=(0,Dh.makeCommand)(Ph,Nh,Mh,Lh,(s,e)=>{if(!e?.length)throw new TypeError("no paths specified to add to archive")})});var Wn=d(lt=>{"use strict";var Ah=lt&&lt.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(lt,"__esModule",{value:!0});lt.getWriteFlag=void 0;var zn=Ah(__nccwpck_require__(9896)),Ih=process.env.__FAKE_PLATFORM__||process.platform,kn=Ih==="win32",{O_CREAT:xn,O_NOFOLLOW:Cn,O_TRUNC:jn,O_WRONLY:Un}=zn.default.constants,qn=Number(process.env.__FAKE_FS_O_FILENAME__)||zn.default.constants.UV_FS_O_FILEMAP||0,Fh=kn&&!!qn,Ch=512*1024,Bh=qn|jn|xn|Un,Bn=!kn&&typeof Cn=="number"?Cn|jn|xn|Un:null;lt.getWriteFlag=Bn!==null?()=>Bn:Fh?s=>s<Ch?Bh:"w":()=>"w"});var Gn=d(le=>{"use strict";var Hn=le&&le.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(le,"__esModule",{value:!0});le.chownrSync=le.chownr=void 0;var ki=Hn(__nccwpck_require__(3024)),Mt=Hn(__nccwpck_require__(6760)),wr=(s,e,t)=>{try{return ki.default.lchownSync(s,e,t)}catch(i){if(i?.code!=="ENOENT")throw i}},zi=(s,e,t,i)=>{ki.default.lchown(s,e,t,r=>{i(r&&r?.code!=="ENOENT"?r:null)})},zh=(s,e,t,i,r)=>{if(e.isDirectory())(0,le.chownr)(Mt.default.resolve(s,e.name),t,i,n=>{if(n)return r(n);let o=Mt.default.resolve(s,e.name);zi(o,t,i,r)});else{let n=Mt.default.resolve(s,e.name);zi(n,t,i,r)}},kh=(s,e,t,i)=>{ki.default.readdir(s,{withFileTypes:!0},(r,n)=>{if(r){if(r.code==="ENOENT")return i();if(r.code!=="ENOTDIR"&&r.code!=="ENOTSUP")return i(r)}if(r||!n.length)return zi(s,e,t,i);let o=n.length,a=null,h=l=>{if(!a){if(l)return i(a=l);if(--o===0)return zi(s,e,t,i)}};for(let l of n)zh(s,l,e,t,h)})};le.chownr=kh;var xh=(s,e,t,i)=>{e.isDirectory()&&(0,le.chownrSync)(Mt.default.resolve(s,e.name),t,i),wr(Mt.default.resolve(s,e.name),t,i)},jh=(s,e,t)=>{let i;try{i=ki.default.readdirSync(s,{withFileTypes:!0})}catch(r){let n=r;if(n?.code==="ENOENT")return;if(n?.code==="ENOTDIR"||n?.code==="ENOTSUP")return wr(s,e,t);throw n}for(let r of i)xh(s,r,e,t);return wr(s,e,t)};le.chownrSync=jh});var Zn=d(xi=>{"use strict";Object.defineProperty(xi,"__esModule",{value:!0});xi.CwdError=void 0;var yr=class extends Error{path;code;syscall="chdir";constructor(e,t){super(`${t}: Cannot cd into '${e}'`),this.path=e,this.code=t}get name(){return"CwdError"}};xi.CwdError=yr});var br=d(ji=>{"use strict";Object.defineProperty(ji,"__esModule",{value:!0});ji.SymlinkError=void 0;var Er=class extends Error{path;symlink;syscall="symlink";code="TAR_SYMLINK_ERROR";constructor(e,t){super("TAR_SYMLINK_ERROR: Cannot extract through symbolic link"),this.symlink=e,this.path=t}get name(){return"SymlinkError"}};ji.SymlinkError=Er});var Xn=d(De=>{"use strict";var gr=De&&De.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(De,"__esModule",{value:!0});De.mkdirSync=De.mkdir=void 0;var Yn=Gn(),j=gr(__nccwpck_require__(3024)),Uh=gr(__nccwpck_require__(1455)),Ui=gr(__nccwpck_require__(6760)),Kn=Zn(),_e=tt(),Vn=br(),qh=(s,e)=>{j.default.stat(s,(t,i)=>{(t||!i.isDirectory())&&(t=new Kn.CwdError(s,t?.code||"ENOTDIR")),e(t)})},Wh=(s,e,t)=>{s=(0,_e.normalizeWindowsPath)(s);let i=e.umask??18,r=e.mode|448,n=(r&i)!==0,o=e.uid,a=e.gid,h=typeof o=="number"&&typeof a=="number"&&(o!==e.processUid||a!==e.processGid),l=e.preserve,c=e.unlink,u=(0,_e.normalizeWindowsPath)(e.cwd),b=(w,P)=>{w?t(w):P&&h?(0,Yn.chownr)(P,o,a,xt=>b(xt)):n?j.default.chmod(s,r,t):t()};if(s===u)return qh(s,b);if(l)return Uh.default.mkdir(s,{mode:r,recursive:!0}).then(w=>b(null,w??void 0),b);let A=(0,_e.normalizeWindowsPath)(Ui.default.relative(u,s)).split("/");Sr(u,A,r,c,u,void 0,b)};De.mkdir=Wh;var Sr=(s,e,t,i,r,n,o)=>{if(e.length===0)return o(null,n);let a=e.shift(),h=(0,_e.normalizeWindowsPath)(Ui.default.resolve(s+"/"+a));j.default.mkdir(h,t,$n(h,e,t,i,r,n,o))},$n=(s,e,t,i,r,n,o)=>a=>{a?j.default.lstat(s,(h,l)=>{if(h)h.path=h.path&&(0,_e.normalizeWindowsPath)(h.path),o(h);else if(l.isDirectory())Sr(s,e,t,i,r,n,o);else if(i)j.default.unlink(s,c=>{if(c)return o(c);j.default.mkdir(s,t,$n(s,e,t,i,r,n,o))});else{if(l.isSymbolicLink())return o(new Vn.SymlinkError(s,s+"/"+e.join("/")));o(a)}}):(n=n||s,Sr(s,e,t,i,r,n,o))},Hh=s=>{let e=!1,t;try{e=j.default.statSync(s).isDirectory()}catch(i){t=i?.code}finally{if(!e)throw new Kn.CwdError(s,t??"ENOTDIR")}},Gh=(s,e)=>{s=(0,_e.normalizeWindowsPath)(s);let t=e.umask??18,i=e.mode|448,r=(i&t)!==0,n=e.uid,o=e.gid,a=typeof n=="number"&&typeof o=="number"&&(n!==e.processUid||o!==e.processGid),h=e.preserve,l=e.unlink,c=(0,_e.normalizeWindowsPath)(e.cwd),u=w=>{w&&a&&(0,Yn.chownrSync)(w,n,o),r&&j.default.chmodSync(s,i)};if(s===c)return Hh(c),u();if(h)return u(j.default.mkdirSync(s,{mode:i,recursive:!0})??void 0);let D=(0,_e.normalizeWindowsPath)(Ui.default.relative(c,s)).split("/"),A;for(let w=D.shift(),P=c;w&&(P+="/"+w);w=D.shift()){P=(0,_e.normalizeWindowsPath)(Ui.default.resolve(P));try{j.default.mkdirSync(P,i),A=A||P}catch{let xt=j.default.lstatSync(P);if(xt.isDirectory())continue;if(l){j.default.unlinkSync(P),j.default.mkdirSync(P,i),A=A||P;continue}else if(xt.isSymbolicLink())return new Vn.SymlinkError(P,P+"/"+D.join("/"))}}return u(A)};De.mkdirSync=Gh});var Jn=d(qi=>{"use strict";Object.defineProperty(qi,"__esModule",{value:!0});qi.normalizeUnicode=void 0;var Rr=Object.create(null),Qn=1e4,ct=new Set,Zh=s=>{ct.has(s)?ct.delete(s):Rr[s]=s.normalize("NFD").toLocaleLowerCase("en").toLocaleUpperCase("en"),ct.add(s);let e=Rr[s],t=ct.size-Qn;if(t>Qn/10){for(let i of ct)if(ct.delete(i),delete Rr[i],--t<=0)break}return e};qi.normalizeUnicode=Zh});var to=d(Wi=>{"use strict";Object.defineProperty(Wi,"__esModule",{value:!0});Wi.PathReservations=void 0;var eo=__nccwpck_require__(6760),Yh=Jn(),Kh=yi(),Vh=process.env.TESTING_TAR_FAKE_PLATFORM||process.platform,$h=Vh==="win32",Xh=s=>s.split("/").slice(0,-1).reduce((t,i)=>{let r=t.at(-1);return r!==void 0&&(i=(0,eo.join)(r,i)),t.push(i||"/"),t},[]),Or=class{#e=new Map;#i=new Map;#s=new Set;reserve(e,t){e=$h?["win32 parallelization disabled"]:e.map(r=>(0,Kh.stripTrailingSlashes)((0,eo.join)((0,Yh.normalizeUnicode)(r))));let i=new Set(e.map(r=>Xh(r)).reduce((r,n)=>r.concat(n)));this.#i.set(t,{dirs:i,paths:e});for(let r of e){let n=this.#e.get(r);n?n.push(t):this.#e.set(r,[t])}for(let r of i){let n=this.#e.get(r);if(!n)this.#e.set(r,[new Set([t])]);else{let o=n.at(-1);o instanceof Set?o.add(t):n.push(new Set([t]))}}return this.#r(t)}#n(e){let t=this.#i.get(e);if(!t)throw new Error("function does not have any path reservations");return{paths:t.paths.map(i=>this.#e.get(i)),dirs:[...t.dirs].map(i=>this.#e.get(i))}}check(e){let{paths:t,dirs:i}=this.#n(e);return t.every(r=>r&&r[0]===e)&&i.every(r=>r&&r[0]instanceof Set&&r[0].has(e))}#r(e){return this.#s.has(e)||!this.check(e)?!1:(this.#s.add(e),e(()=>this.#t(e)),!0)}#t(e){if(!this.#s.has(e))return!1;let t=this.#i.get(e);if(!t)throw new Error("invalid reservation");let{paths:i,dirs:r}=t,n=new Set;for(let o of i){let a=this.#e.get(o);if(!a||a?.[0]!==e)continue;let h=a[1];if(!h){this.#e.delete(o);continue}if(a.shift(),typeof h=="function")n.add(h);else for(let l of h)n.add(l)}for(let o of r){let a=this.#e.get(o),h=a?.[0];if(!(!a||!(h instanceof Set)))if(h.size===1&&a.length===1){this.#e.delete(o);continue}else if(h.size===1){a.shift();let l=a[0];typeof l=="function"&&n.add(l)}else h.delete(e)}return this.#s.delete(e),n.forEach(o=>this.#r(o)),!0}};Wi.PathReservations=Or});var io=d(Hi=>{"use strict";Object.defineProperty(Hi,"__esModule",{value:!0});Hi.umask=void 0;var Qh=()=>process.umask();Hi.umask=Qh});var Cr=d(k=>{"use strict";var Jh=k&&k.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),el=k&&k.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),fo=k&&k.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&Jh(t,e,i[r]);return el(t,e),t}})(),Fr=k&&k.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(k,"__esModule",{value:!0});k.UnpackSync=k.Unpack=void 0;var tl=fo(Ke()),il=Fr(__nccwpck_require__(4589)),mo=__nccwpck_require__(7598),m=Fr(__nccwpck_require__(3024)),g=Fr(__nccwpck_require__(6760)),po=Wn(),_o=Xn(),U=tt(),sl=_i(),rl=Zs(),so=fo(Ks()),nl=to(),wo=br(),ol=io(),ro=Symbol("onEntry"),Pr=Symbol("checkFs"),no=Symbol("checkFs2"),Nr=Symbol("isReusable"),G=Symbol("makeFs"),Mr=Symbol("file"),Lr=Symbol("directory"),Zi=Symbol("link"),oo=Symbol("symlink"),ao=Symbol("hardlink"),At=Symbol("ensureNoSymlink"),ho=Symbol("unsupported"),lo=Symbol("checkPath"),vr=Symbol("stripAbsolutePath"),Pe=Symbol("mkdir"),T=Symbol("onError"),Gi=Symbol("pending"),co=Symbol("pend"),ut=Symbol("unpend"),Tr=Symbol("ended"),Dr=Symbol("maybeClose"),Ar=Symbol("skip"),It=Symbol("doChown"),Ft=Symbol("uid"),Ct=Symbol("gid"),Bt=Symbol("checkedCwd"),al=process.env.TESTING_TAR_FAKE_PLATFORM||process.platform,zt=al==="win32",hl=1024,ll=(s,e)=>{if(!zt)return m.default.unlink(s,e);let t=s+".DELETE."+(0,mo.randomBytes)(16).toString("hex");m.default.rename(s,t,i=>{if(i)return e(i);m.default.unlink(t,e)})},cl=s=>{if(!zt)return m.default.unlinkSync(s);let e=s+".DELETE."+(0,mo.randomBytes)(16).toString("hex");m.default.renameSync(s,e),m.default.unlinkSync(e)},uo=(s,e,t)=>s!==void 0&&s===s>>>0?s:e!==void 0&&e===e>>>0?e:t,Yi=class extends sl.Parser{[Tr]=!1;[Bt]=!1;[Gi]=0;reservations=new nl.PathReservations;transform;writable=!0;readable=!1;uid;gid;setOwner;preserveOwner;processGid;processUid;maxDepth;forceChown;win32;newer;keep;noMtime;preservePaths;unlink;cwd;strip;processUmask;umask;dmode;fmode;chmod;constructor(e={}){if(e.ondone=()=>{this[Tr]=!0,this[Dr]()},super(e),this.transform=e.transform,this.chmod=!!e.chmod,typeof e.uid=="number"||typeof e.gid=="number"){if(typeof e.uid!="number"||typeof e.gid!="number")throw new TypeError("cannot set owner without number uid and gid");if(e.preserveOwner)throw new TypeError("cannot preserve owner in archive and also set owner explicitly");this.uid=e.uid,this.gid=e.gid,this.setOwner=!0}else this.uid=void 0,this.gid=void 0,this.setOwner=!1;this.preserveOwner=e.preserveOwner===void 0&&typeof e.uid!="number"?process.getuid?.()===0:!!e.preserveOwner,this.processUid=(this.preserveOwner||this.setOwner)&&process.getuid?process.getuid():void 0,this.processGid=(this.preserveOwner||this.setOwner)&&process.getgid?process.getgid():void 0,this.maxDepth=typeof e.maxDepth=="number"?e.maxDepth:hl,this.forceChown=e.forceChown===!0,this.win32=!!e.win32||zt,this.newer=!!e.newer,this.keep=!!e.keep,this.noMtime=!!e.noMtime,this.preservePaths=!!e.preservePaths,this.unlink=!!e.unlink,this.cwd=(0,U.normalizeWindowsPath)(g.default.resolve(e.cwd||process.cwd())),this.strip=Number(e.strip)||0,this.processUmask=this.chmod?typeof e.processUmask=="number"?e.processUmask:(0,ol.umask)():0,this.umask=typeof e.umask=="number"?e.umask:this.processUmask,this.dmode=e.dmode||511&~this.umask,this.fmode=e.fmode||438&~this.umask,this.on("entry",t=>this[ro](t))}warn(e,t,i={}){return(e==="TAR_BAD_ARCHIVE"||e==="TAR_ABORT")&&(i.recoverable=!1),super.warn(e,t,i)}[Dr](){this[Tr]&&this[Gi]===0&&(this.emit("prefinish"),this.emit("finish"),this.emit("end"))}[vr](e,t){let i=e[t],{type:r}=e;if(!i||this.preservePaths)return!0;let[n,o]=(0,rl.stripAbsolutePath)(i),a=o.replaceAll(/\\/g,"/").split("/");if(a.includes("..")||zt&&/^[a-z]:\.\.$/i.test(a[0]??"")){if(t==="path"||r==="Link")return this.warn("TAR_ENTRY_ERROR",`${t} contains '..'`,{entry:e,[t]:i}),!1;let h=g.default.posix.dirname(e.path),l=g.default.posix.normalize(g.default.posix.join(h,a.join("/")));if(l.startsWith("../")||l==="..")return this.warn("TAR_ENTRY_ERROR",`${t} escapes extraction directory`,{entry:e,[t]:i}),!1}return n&&(e[t]=String(o),this.warn("TAR_ENTRY_INFO",`stripping ${n} from absolute ${t}`,{entry:e,[t]:i})),!0}[lo](e){let t=(0,U.normalizeWindowsPath)(e.path),i=t.split("/");if(this.strip){if(i.length<this.strip)return!1;if(e.type==="Link"){let r=(0,U.normalizeWindowsPath)(String(e.linkpath)).split("/");if(r.length>=this.strip)e.linkpath=r.slice(this.strip).join("/");else return!1}i.splice(0,this.strip),e.path=i.join("/")}if(isFinite(this.maxDepth)&&i.length>this.maxDepth)return this.warn("TAR_ENTRY_ERROR","path excessively deep",{entry:e,path:t,depth:i.length,maxDepth:this.maxDepth}),!1;if(!this[vr](e,"path")||!this[vr](e,"linkpath"))return!1;if(e.absolute=g.default.isAbsolute(e.path)?(0,U.normalizeWindowsPath)(g.default.resolve(e.path)):(0,U.normalizeWindowsPath)(g.default.resolve(this.cwd,e.path)),!this.preservePaths&&typeof e.absolute=="string"&&e.absolute.indexOf(this.cwd+"/")!==0&&e.absolute!==this.cwd)return this.warn("TAR_ENTRY_ERROR","path escaped extraction target",{entry:e,path:(0,U.normalizeWindowsPath)(e.path),resolvedPath:e.absolute,cwd:this.cwd}),!1;if(e.absolute===this.cwd&&e.type!=="Directory"&&e.type!=="GNUDumpDir")return!1;if(this.win32){let{root:r}=g.default.win32.parse(String(e.absolute));e.absolute=r+so.encode(String(e.absolute).slice(r.length));let{root:n}=g.default.win32.parse(e.path);e.path=n+so.encode(e.path.slice(n.length))}return!0}[ro](e){if(!this[lo](e))return e.resume();switch(il.default.equal(typeof e.absolute,"string"),e.type){case"Directory":case"GNUDumpDir":e.mode&&(e.mode=e.mode|448);case"File":case"OldFile":case"ContiguousFile":case"Link":case"SymbolicLink":return this[Pr](e);default:return this[ho](e)}}[T](e,t){e.name==="CwdError"?this.emit("error",e):(this.warn("TAR_ENTRY_ERROR",e,{entry:t}),this[ut](),t.resume())}[Pe](e,t,i){(0,_o.mkdir)((0,U.normalizeWindowsPath)(e),{uid:this.uid,gid:this.gid,processUid:this.processUid,processGid:this.processGid,umask:this.processUmask,preserve:this.preservePaths,unlink:this.unlink,cwd:this.cwd,mode:t},i)}[It](e){return this.forceChown||this.preserveOwner&&(typeof e.uid=="number"&&e.uid!==this.processUid||typeof e.gid=="number"&&e.gid!==this.processGid)||typeof this.uid=="number"&&this.uid!==this.processUid||typeof this.gid=="number"&&this.gid!==this.processGid}[Ft](e){return uo(this.uid,e.uid,this.processUid)}[Ct](e){return uo(this.gid,e.gid,this.processGid)}[Mr](e,t){let i=typeof e.mode=="number"?e.mode&4095:this.fmode,r=new tl.WriteStream(String(e.absolute),{flags:(0,po.getWriteFlag)(e.size),mode:i,autoClose:!1});r.on("error",h=>{r.fd&&m.default.close(r.fd,()=>{}),r.write=()=>!0,this[T](h,e),t()});let n=1,o=h=>{if(h){r.fd&&m.default.close(r.fd,()=>{}),this[T](h,e),t();return}--n===0&&r.fd!==void 0&&m.default.close(r.fd,l=>{l?this[T](l,e):this[ut](),t()})};r.on("finish",()=>{let h=String(e.absolute),l=r.fd;if(typeof l=="number"&&e.mtime&&!this.noMtime){n++;let c=e.atime||new Date,u=e.mtime;m.default.futimes(l,c,u,b=>b?m.default.utimes(h,c,u,D=>o(D&&b)):o())}if(typeof l=="number"&&this[It](e)){n++;let c=this[Ft](e),u=this[Ct](e);typeof c=="number"&&typeof u=="number"&&m.default.fchown(l,c,u,b=>b?m.default.chown(h,c,u,D=>o(D&&b)):o())}o()});let a=this.transform&&this.transform(e)||e;a!==e&&(a.on("error",h=>{this[T](h,e),t()}),e.pipe(a)),a.pipe(r)}[Lr](e,t){let i=typeof e.mode=="number"?e.mode&4095:this.dmode;this[Pe](String(e.absolute),i,r=>{if(r){this[T](r,e),t();return}let n=1,o=()=>{--n===0&&(t(),this[ut](),e.resume())};e.mtime&&!this.noMtime&&(n++,m.default.utimes(String(e.absolute),e.atime||new Date,e.mtime,o)),this[It](e)&&(n++,m.default.chown(String(e.absolute),Number(this[Ft](e)),Number(this[Ct](e)),o)),o()})}[ho](e){e.unsupported=!0,this.warn("TAR_ENTRY_UNSUPPORTED",`unsupported entry type: ${e.type}`,{entry:e}),e.resume()}[oo](e,t){let i=(0,U.normalizeWindowsPath)(g.default.relative(this.cwd,g.default.resolve(g.default.dirname(String(e.absolute)),String(e.linkpath)))).split("/");this[At](e,this.cwd,i,()=>this[Zi](e,String(e.linkpath),"symlink",t),r=>{this[T](r,e),t()})}[ao](e,t){let i=(0,U.normalizeWindowsPath)(g.default.resolve(this.cwd,String(e.linkpath))),r=(0,U.normalizeWindowsPath)(String(e.linkpath)).split("/");this[At](e,this.cwd,r,()=>this[Zi](e,i,"link",t),n=>{this[T](n,e),t()})}[At](e,t,i,r,n){let o=i.shift();if(this.preservePaths||o===void 0)return r();let a=g.default.resolve(t,o);m.default.lstat(a,(h,l)=>{if(h)return r();if(l?.isSymbolicLink())return n(new wo.SymlinkError(a,g.default.resolve(a,i.join("/"))));this[At](e,a,i,r,n)})}[co](){this[Gi]++}[ut](){this[Gi]--,this[Dr]()}[Ar](e){this[ut](),e.resume()}[Nr](e,t){return e.type==="File"&&!this.unlink&&t.isFile()&&t.nlink<=1&&!zt}[Pr](e){this[co]();let t=[e.path];e.linkpath&&t.push(e.linkpath),this.reservations.reserve(t,i=>this[no](e,i))}[no](e,t){let i=a=>{t(a)},r=()=>{this[Pe](this.cwd,this.dmode,a=>{if(a){this[T](a,e),i();return}this[Bt]=!0,n()})},n=()=>{if(e.absolute!==this.cwd){let a=(0,U.normalizeWindowsPath)(g.default.dirname(String(e.absolute)));if(a!==this.cwd)return this[Pe](a,this.dmode,h=>{if(h){this[T](h,e),i();return}o()})}o()},o=()=>{m.default.lstat(String(e.absolute),(a,h)=>{if(h&&(this.keep||this.newer&&h.mtime>(e.mtime??h.mtime))){this[Ar](e),i();return}if(a||this[Nr](e,h))return this[G](null,e,i);if(h.isDirectory()){if(e.type==="Directory"){let l=this.chmod&&e.mode&&(h.mode&4095)!==e.mode,c=u=>this[G](u??null,e,i);return l?m.default.chmod(String(e.absolute),Number(e.mode),c):c()}if(e.absolute!==this.cwd)return m.default.rmdir(String(e.absolute),l=>this[G](l??null,e,i))}if(e.absolute===this.cwd)return this[G](null,e,i);ll(String(e.absolute),l=>this[G](l??null,e,i))})};this[Bt]?n():r()}[G](e,t,i){if(e){this[T](e,t),i();return}switch(t.type){case"File":case"OldFile":case"ContiguousFile":return this[Mr](t,i);case"Link":return this[ao](t,i);case"SymbolicLink":return this[oo](t,i);case"Directory":case"GNUDumpDir":return this[Lr](t,i)}}[Zi](e,t,i,r){m.default[i](t,String(e.absolute),n=>{n?this[T](n,e):(this[ut](),e.resume()),r()})}};k.Unpack=Yi;var Lt=s=>{try{return[null,s()]}catch(e){return[e,null]}},Ir=class extends Yi{sync=!0;[G](e,t){return super[G](e,t,()=>{})}[Pr](e){if(!this[Bt]){let n=this[Pe](this.cwd,this.dmode);if(n)return this[T](n,e);this[Bt]=!0}if(e.absolute!==this.cwd){let n=(0,U.normalizeWindowsPath)(g.default.dirname(String(e.absolute)));if(n!==this.cwd){let o=this[Pe](n,this.dmode);if(o)return this[T](o,e)}}let[t,i]=Lt(()=>m.default.lstatSync(String(e.absolute)));if(i&&(this.keep||this.newer&&i.mtime>(e.mtime??i.mtime)))return this[Ar](e);if(t||this[Nr](e,i))return this[G](null,e);if(i.isDirectory()){if(e.type==="Directory"){let o=this.chmod&&e.mode&&(i.mode&4095)!==e.mode,[a]=o?Lt(()=>{m.default.chmodSync(String(e.absolute),Number(e.mode))}):[];return this[G](a,e)}let[n]=Lt(()=>m.default.rmdirSync(String(e.absolute)));this[G](n,e)}let[r]=e.absolute===this.cwd?[]:Lt(()=>cl(String(e.absolute)));this[G](r,e)}[Mr](e,t){let i=typeof e.mode=="number"?e.mode&4095:this.fmode,r=a=>{let h;try{m.default.closeSync(n)}catch(l){h=l}(a||h)&&this[T](a||h,e),t()},n;try{n=m.default.openSync(String(e.absolute),(0,po.getWriteFlag)(e.size),i)}catch(a){return r(a)}let o=this.transform&&this.transform(e)||e;o!==e&&(o.on("error",a=>this[T](a,e)),e.pipe(o)),o.on("data",a=>{try{m.default.writeSync(n,a,0,a.length)}catch(h){r(h)}}),o.on("end",()=>{let a=null;if(e.mtime&&!this.noMtime){let h=e.atime||new Date,l=e.mtime;try{m.default.futimesSync(n,h,l)}catch(c){try{m.default.utimesSync(String(e.absolute),h,l)}catch{a=c}}}if(this[It](e)){let h=this[Ft](e),l=this[Ct](e);try{m.default.fchownSync(n,Number(h),Number(l))}catch(c){try{m.default.chownSync(String(e.absolute),Number(h),Number(l))}catch{a=a||c}}}r(a)})}[Lr](e,t){let i=typeof e.mode=="number"?e.mode&4095:this.dmode,r=this[Pe](String(e.absolute),i);if(r){this[T](r,e),t();return}if(e.mtime&&!this.noMtime)try{m.default.utimesSync(String(e.absolute),e.atime||new Date,e.mtime)}catch{}if(this[It](e))try{m.default.chownSync(String(e.absolute),Number(this[Ft](e)),Number(this[Ct](e)))}catch{}t(),e.resume()}[Pe](e,t){try{return(0,_o.mkdirSync)((0,U.normalizeWindowsPath)(e),{uid:this.uid,gid:this.gid,processUid:this.processUid,processGid:this.processGid,umask:this.processUmask,preserve:this.preservePaths,unlink:this.unlink,cwd:this.cwd,mode:t})}catch(i){return i}}[At](e,t,i,r,n){if(this.preservePaths||i.length===0)return r();let o=t;for(let a of i){o=g.default.resolve(o,a);let[h,l]=Lt(()=>m.default.lstatSync(o));if(h)return r();if(l.isSymbolicLink())return n(new wo.SymlinkError(o,g.default.resolve(t,i.join("/"))))}r()}[Zi](e,t,i,r){let n=`${i}Sync`;try{m.default[n](t,String(e.absolute)),r(),e.resume()}catch(o){return this[T](o,e)}}};k.UnpackSync=Ir});var Br=d(Z=>{"use strict";var ul=Z&&Z.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),fl=Z&&Z.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),dl=Z&&Z.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&ul(t,e,i[r]);return fl(t,e),t}})(),ml=Z&&Z.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(Z,"__esModule",{value:!0});Z.extract=void 0;var yo=dl(Ke()),Eo=ml(__nccwpck_require__(3024)),pl=rt(),_l=Ve(),Ki=Cr(),wl=s=>{let e=new Ki.UnpackSync(s),t=s.file,i=Eo.default.statSync(t),r=s.maxReadSize||16*1024*1024;new yo.ReadStreamSync(t,{readSize:r,size:i.size}).pipe(e)},yl=(s,e)=>{let t=new Ki.Unpack(s),i=s.maxReadSize||16*1024*1024,r=s.file;return new Promise((o,a)=>{t.on("error",a),t.on("close",o),Eo.default.stat(r,(h,l)=>{if(h)a(h);else{let c=new yo.ReadStream(r,{readSize:i,size:l.size});c.on("error",a),c.pipe(t)}})})};Z.extract=(0,_l.makeCommand)(wl,yl,s=>new Ki.UnpackSync(s),s=>new Ki.Unpack(s),(s,e)=>{e?.length&&(0,pl.filesFilter)(s,e)})});var Vi=d(ft=>{"use strict";var bo=ft&&ft.__importDefault||function(s){return s&&s.__esModule?s:{default:s}};Object.defineProperty(ft,"__esModule",{value:!0});ft.replace=void 0;var So=Ke(),q=bo(__nccwpck_require__(3024)),go=bo(__nccwpck_require__(6760)),Ro=et(),Oo=rt(),El=Ve(),bl=Qt(),vo=Ci(),Sl=(s,e)=>{let t=new vo.PackSync(s),i=!0,r,n;try{try{r=q.default.openSync(s.file,"r+")}catch(h){if(h?.code==="ENOENT")r=q.default.openSync(s.file,"w+");else throw h}let o=q.default.fstatSync(r),a=Buffer.alloc(512);e:for(n=0;n<o.size;n+=512){for(let c=0,u=0;c<512;c+=u){if(u=q.default.readSync(r,a,c,a.length-c,n+c),n===0&&a[0]===31&&a[1]===139)throw new Error("cannot append to compressed archives");if(!u)break e}let h=new Ro.Header(a);if(!h.cksumValid)break;let l=512*Math.ceil((h.size||0)/512);if(n+l+512>o.size)break;n+=l,s.mtimeCache&&h.mtime&&s.mtimeCache.set(String(h.path),h.mtime)}i=!1,gl(s,t,n,r,e)}finally{if(i)try{q.default.closeSync(r)}catch{}}},gl=(s,e,t,i,r)=>{let n=new So.WriteStreamSync(s.file,{fd:i,start:t});e.pipe(n),Ol(e,r)},Rl=(s,e)=>{e=Array.from(e);let t=new vo.Pack(s),i=(n,o,a)=>{let h=(D,A)=>{D?q.default.close(n,w=>a(D)):a(null,A)},l=0;if(o===0)return h(null,0);let c=0,u=Buffer.alloc(512),b=(D,A)=>{if(D||A===void 0)return h(D);if(c+=A,c<512&&A)return q.default.read(n,u,c,u.length-c,l+c,b);if(l===0&&u[0]===31&&u[1]===139)return h(new Error("cannot append to compressed archives"));if(c<512)return h(null,l);let w=new Ro.Header(u);if(!w.cksumValid)return h(null,l);let P=512*Math.ceil((w.size??0)/512);if(l+P+512>o||(l+=P+512,l>=o))return h(null,l);s.mtimeCache&&w.mtime&&s.mtimeCache.set(String(w.path),w.mtime),c=0,q.default.read(n,u,0,512,l,b)};q.default.read(n,u,0,512,l,b)};return new Promise((n,o)=>{t.on("error",o);let a="r+",h=(l,c)=>{if(l&&l.code==="ENOENT"&&a==="r+")return a="w+",q.default.open(s.file,a,h);if(l||!c)return o(l);q.default.fstat(c,(u,b)=>{if(u)return q.default.close(c,()=>o(u));i(c,b.size,(D,A)=>{if(D)return o(D);let w=new So.WriteStream(s.file,{fd:c,start:A});t.pipe(w),w.on("error",o),w.on("close",n),vl(t,e)})})};q.default.open(s.file,a,h)})},Ol=(s,e)=>{e.forEach(t=>{t.charAt(0)==="@"?(0,Oo.list)({file:go.default.resolve(s.cwd,t.slice(1)),sync:!0,noResume:!0,onReadEntry:i=>s.add(i)}):s.add(t)}),s.end()},vl=async(s,e)=>{for(let t of e)t.charAt(0)==="@"?await(0,Oo.list)({file:go.default.resolve(String(s.cwd),t.slice(1)),noResume:!0,onReadEntry:i=>s.add(i)}):s.add(t);s.end()};ft.replace=(0,El.makeCommand)(Sl,Rl,()=>{throw new TypeError("file is required")},()=>{throw new TypeError("file is required")},(s,e)=>{if(!(0,bl.isFile)(s))throw new TypeError("file is required");if(s.gzip||s.brotli||s.zstd||s.file.endsWith(".br")||s.file.endsWith(".tbr"))throw new TypeError("cannot append to compressed archives");if(!e?.length)throw new TypeError("no paths specified to add/replace")})});var zr=d($i=>{"use strict";Object.defineProperty($i,"__esModule",{value:!0});$i.update=void 0;var Tl=Ve(),kt=Vi();$i.update=(0,Tl.makeCommand)(kt.replace.syncFile,kt.replace.asyncFile,kt.replace.syncNoFile,kt.replace.asyncNoFile,(s,e=[])=>{kt.replace.validate?.(s,e),Dl(s)});var Dl=s=>{let e=s.filter;s.mtimeCache||(s.mtimeCache=new Map),s.filter=e?(t,i)=>e(t,i)&&!((s.mtimeCache?.get(t)??i.mtime??0)>(i.mtime??0)):(t,i)=>!((s.mtimeCache?.get(t)??i.mtime??0)>(i.mtime??0))}});var To=exports&&exports.__createBinding||(Object.create?(function(s,e,t,i){i===void 0&&(i=t);var r=Object.getOwnPropertyDescriptor(e,t);(!r||("get"in r?!e.__esModule:r.writable||r.configurable))&&(r={enumerable:!0,get:function(){return e[t]}}),Object.defineProperty(s,i,r)}):(function(s,e,t,i){i===void 0&&(i=t),s[i]=e[t]})),Pl=exports&&exports.__setModuleDefault||(Object.create?(function(s,e){Object.defineProperty(s,"default",{enumerable:!0,value:e})}):function(s,e){s.default=e}),Y=exports&&exports.__exportStar||function(s,e){for(var t in s)t!=="default"&&!Object.prototype.hasOwnProperty.call(e,t)&&To(e,s,t)},Nl=exports&&exports.__importStar||(function(){var s=function(e){return s=Object.getOwnPropertyNames||function(t){var i=[];for(var r in t)Object.prototype.hasOwnProperty.call(t,r)&&(i[i.length]=r);return i},s(e)};return function(e){if(e&&e.__esModule)return e;var t={};if(e!=null)for(var i=s(e),r=0;r<i.length;r++)i[r]!=="default"&&To(t,e,i[r]);return Pl(t,e),t}})();Object.defineProperty(exports, "__esModule", ({value:!0}));exports.u=exports.types=exports.r=exports.t=exports.x=exports.c=void 0;Y(_r(),exports);var Ml=_r();Object.defineProperty(exports, "c", ({enumerable:!0,get:function(){return Ml.create}}));Y(Br(),exports);var Ll=Br();Object.defineProperty(exports, "x", ({enumerable:!0,get:function(){return Ll.extract}}));Y(et(),exports);Y(rt(),exports);var Al=rt();Object.defineProperty(exports, "t", ({enumerable:!0,get:function(){return Al.list}}));Y(Ci(),exports);Y(_i(),exports);Y(si(),exports);Y(Cs(),exports);Y(Vi(),exports);var Il=Vi();Object.defineProperty(exports, "r", ({enumerable:!0,get:function(){return Il.replace}}));exports.types=Nl(Ns());Y(Cr(),exports);Y(zr(),exports);var Fl=zr();Object.defineProperty(exports, "u", ({enumerable:!0,get:function(){return Fl.update}}));Y(nr(),exports);
 //# sourceMappingURL=index.min.js.map
 
 
@@ -41183,12 +41758,13 @@ var d=(s,e)=>()=>(e||s((e={exports:{}}).exports,e),e.exports);var We=d(F=>{"use 
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
-/*! Axios v1.16.0 Copyright (c) 2026 Matt Zabriskie and contributors */
+/*! Axios v1.18.1 Copyright (c) 2026 Matt Zabriskie and contributors */
 
 
 var FormData$1 = __nccwpck_require__(6454);
 var crypto = __nccwpck_require__(6982);
 var url = __nccwpck_require__(7016);
+var HttpsProxyAgent = __nccwpck_require__(3669);
 var http = __nccwpck_require__(8611);
 var https = __nccwpck_require__(5692);
 var http2 = __nccwpck_require__(5675);
@@ -41224,6 +41800,52 @@ const {
   iterator,
   toStringTag
 } = Symbol;
+
+/* Creating a function that will check if an object has a property. */
+const hasOwnProperty = (({
+  hasOwnProperty
+}) => (obj, prop) => hasOwnProperty.call(obj, prop))(Object.prototype);
+
+/**
+ * Walk the prototype chain (excluding the shared Object.prototype) looking for
+ * an own `prop`. This distinguishes genuine own/inherited members — including
+ * class accessors and template prototypes — from members injected via
+ * Object.prototype pollution (e.g. `Object.prototype.username = '...'`), which
+ * live on Object.prototype itself and are therefore never matched.
+ *
+ * @param {*} thing The value whose chain to inspect
+ * @param {string|symbol} prop The property key to look for
+ *
+ * @returns {boolean} True when `prop` is owned below Object.prototype
+ */
+const hasOwnInPrototypeChain = (thing, prop) => {
+  let obj = thing;
+  const seen = [];
+  while (obj != null && obj !== Object.prototype) {
+    if (seen.indexOf(obj) !== -1) {
+      return false;
+    }
+    seen.push(obj);
+    if (hasOwnProperty(obj, prop)) {
+      return true;
+    }
+    obj = getPrototypeOf(obj);
+  }
+  return false;
+};
+
+/**
+ * Read `obj[prop]` only when it is safe from Object.prototype pollution. Own
+ * properties and members inherited from a non-Object.prototype source (a class
+ * instance or template object) are honored; a value reachable only through a
+ * polluted Object.prototype is ignored and `undefined` is returned.
+ *
+ * @param {*} obj The source object
+ * @param {string|symbol} prop The property key to read
+ *
+ * @returns {*} The resolved value, or undefined when unsafe/absent
+ */
+const getSafeProp = (obj, prop) => obj != null && hasOwnInPrototypeChain(obj, prop) ? obj[prop] : undefined;
 const kindOf = (cache => thing => {
   const str = toString.call(thing);
   return cache[str] || (cache[str] = str.slice(8, -1).toLowerCase());
@@ -41342,11 +41964,15 @@ const isBoolean = thing => thing === true || thing === false;
  * @returns {boolean} True if value is a plain Object, otherwise false
  */
 const isPlainObject = val => {
-  if (kindOf(val) !== 'object') {
+  if (!isObject(val)) {
     return false;
   }
   const prototype = getPrototypeOf(val);
-  return (prototype === null || prototype === Object.prototype || Object.getPrototypeOf(prototype) === null) && !(toStringTag in val) && !(iterator in val);
+  return (prototype === null || prototype === Object.prototype || getPrototypeOf(prototype) === null) &&
+  // Treat any genuine (non-Object.prototype-polluted) Symbol.toStringTag or
+  // Symbol.iterator as evidence the value is a tagged/iterable type rather
+  // than a plain object, while ignoring keys injected onto Object.prototype.
+  !hasOwnInPrototypeChain(val, toStringTag) && !hasOwnInPrototypeChain(val, iterator);
 };
 
 /**
@@ -41601,7 +42227,10 @@ function merge(...objs) {
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
       return;
     }
-    const targetKey = caseless && findKey(result, key) || key;
+
+    // findKey lowercases the key, so caseless lookup only applies to strings —
+    // symbol keys are identity-matched.
+    const targetKey = caseless && typeof key === 'string' && findKey(result, key) || key;
     // Read via own-prop only — a bare `result[targetKey]` walks the prototype
     // chain, so a polluted Object.prototype value could surface here and get
     // copied into the merged result.
@@ -41617,7 +42246,21 @@ function merge(...objs) {
     }
   };
   for (let i = 0, l = objs.length; i < l; i++) {
-    objs[i] && forEach(objs[i], assignValue);
+    const source = objs[i];
+    if (!source || isBuffer(source)) {
+      continue;
+    }
+    forEach(source, assignValue);
+    if (typeof source !== 'object' || isArray(source)) {
+      continue;
+    }
+    const symbols = Object.getOwnPropertySymbols(source);
+    for (let j = 0; j < symbols.length; j++) {
+      const symbol = symbols[j];
+      if (propertyIsEnumerable.call(source, symbol)) {
+        assignValue(source[symbol], symbol);
+      }
+    }
   }
   return result;
 }
@@ -41829,11 +42472,9 @@ const toCamelCase = str => {
     return p1.toUpperCase() + p2;
   });
 };
-
-/* Creating a function that will check if an object has a property. */
-const hasOwnProperty = (({
-  hasOwnProperty
-}) => (obj, prop) => hasOwnProperty.call(obj, prop))(Object.prototype);
+const {
+  propertyIsEnumerable
+} = Object.prototype;
 
 /**
  * Determine if a value is a RegExp object
@@ -41922,10 +42563,10 @@ function isSpecCompliantForm(thing) {
  * @returns {Object} The JSON-compatible object.
  */
 const toJSONObject = obj => {
-  const stack = new Array(10);
-  const visit = (source, i) => {
+  const visited = new WeakSet();
+  const visit = source => {
     if (isObject(source)) {
-      if (stack.indexOf(source) >= 0) {
+      if (visited.has(source)) {
         return;
       }
 
@@ -41934,19 +42575,20 @@ const toJSONObject = obj => {
         return source;
       }
       if (!('toJSON' in source)) {
-        stack[i] = source;
+        // add-on descent / delete-on-ascent: preserves path semantics, so DAG nodes serialise at every occurrence (see #7230).
+        visited.add(source);
         const target = isArray(source) ? [] : {};
         forEach(source, (value, key) => {
-          const reducedValue = visit(value, i + 1);
+          const reducedValue = visit(value);
           !isUndefined(reducedValue) && (target[key] = reducedValue);
         });
-        stack[i] = undefined;
+        visited.delete(source);
         return target;
       }
     }
     return source;
   };
-  return visit(obj, 0);
+  return visit(obj);
 };
 
 /**
@@ -42007,6 +42649,19 @@ const asap = typeof queueMicrotask !== 'undefined' ? queueMicrotask.bind(_global
 // *********************
 
 const isIterable = thing => thing != null && isFunction$1(thing[iterator]);
+
+/**
+ * Determine if a value is iterable via an iterator that is NOT sourced solely
+ * from a polluted Object.prototype. Use this instead of `isIterable` whenever
+ * the iterable comes from untrusted input (e.g. user-supplied header sources),
+ * so `Object.prototype[Symbol.iterator] = ...` cannot turn an ordinary object
+ * into an attacker-controlled entries iterator.
+ *
+ * @param {*} thing The value to test
+ *
+ * @returns {boolean} True if value has a non-polluted iterator
+ */
+const isSafeIterable = thing => thing != null && hasOwnInPrototypeChain(thing, iterator) && isIterable(thing);
 var utils$1 = {
   isArray,
   isArrayBuffer,
@@ -42052,6 +42707,8 @@ var utils$1 = {
   hasOwnProperty,
   hasOwnProp: hasOwnProperty,
   // an alias to avoid ESLint no-prototype-builtins detection
+  hasOwnInPrototypeChain,
+  getSafeProp,
   reduceDescriptors,
   freezeMethods,
   toObjectSet,
@@ -42067,7 +42724,8 @@ var utils$1 = {
   isThenable,
   setImmediate: _setImmediate,
   asap,
-  isIterable
+  isIterable,
+  isSafeIterable
 };
 
 // RawAxiosHeaders whose duplicates are ignored by node
@@ -42113,8 +42771,6 @@ var parseHeaders = rawHeaders => {
   return parsed;
 };
 
-const $internals = Symbol('internals');
-const INVALID_HEADER_VALUE_CHARS_RE = /[^\x09\x20-\x7E\x80-\xFF]/g;
 function trimSPorHTAB(str) {
   let start = 0;
   let end = str.length;
@@ -42134,11 +42790,31 @@ function trimSPorHTAB(str) {
   }
   return start === 0 && end === str.length ? str : str.slice(start, end);
 }
+
+// The control-code ranges are intentional: header sanitization strips C0/DEL bytes.
+// eslint-disable-next-line no-control-regex
+const INVALID_UNICODE_HEADER_VALUE_CHARS = new RegExp('[\\u0000-\\u0008\\u000a-\\u001f\\u007f]+', 'g');
+// eslint-disable-next-line no-control-regex
+const INVALID_BYTE_STRING_HEADER_VALUE_CHARS = new RegExp('[^\\u0009\\u0020-\\u007e\\u0080-\\u00ff]+', 'g');
+function sanitizeValue(value, invalidChars) {
+  if (utils$1.isArray(value)) {
+    return value.map(item => sanitizeValue(item, invalidChars));
+  }
+  return trimSPorHTAB(String(value).replace(invalidChars, ''));
+}
+const sanitizeHeaderValue = value => sanitizeValue(value, INVALID_UNICODE_HEADER_VALUE_CHARS);
+const sanitizeByteStringHeaderValue = value => sanitizeValue(value, INVALID_BYTE_STRING_HEADER_VALUE_CHARS);
+function toByteStringHeaderObject(headers) {
+  const byteStringHeaders = Object.create(null);
+  utils$1.forEach(headers.toJSON(), (value, header) => {
+    byteStringHeaders[header] = sanitizeByteStringHeaderValue(value);
+  });
+  return byteStringHeaders;
+}
+
+const $internals = Symbol('internals');
 function normalizeHeader(header) {
   return header && String(header).trim().toLowerCase();
-}
-function sanitizeHeaderValue(str) {
-  return trimSPorHTAB(str.replace(INVALID_HEADER_VALUE_CHARS_RE, ''));
 }
 function normalizeValue(value) {
   if (value === false || value == null) {
@@ -42199,7 +42875,7 @@ class AxiosHeaders {
     function setHeader(_value, _header, _rewrite) {
       const lHeader = normalizeHeader(_header);
       if (!lHeader) {
-        throw new Error('header name must be a non-empty string');
+        return;
       }
       const key = utils$1.findKey(self, lHeader);
       if (!key || self[key] === undefined || _rewrite === true || _rewrite === undefined && self[key] !== false) {
@@ -42211,15 +42887,21 @@ class AxiosHeaders {
       setHeaders(header, valueOrRewrite);
     } else if (utils$1.isString(header) && (header = header.trim()) && !isValidHeaderName(header)) {
       setHeaders(parseHeaders(header), valueOrRewrite);
-    } else if (utils$1.isObject(header) && utils$1.isIterable(header)) {
-      let obj = {},
+    } else if (utils$1.isObject(header) && utils$1.isSafeIterable(header)) {
+      let obj = Object.create(null),
         dest,
         key;
       for (const entry of header) {
         if (!utils$1.isArray(entry)) {
-          throw TypeError('Object iterator must return a key-value pair');
+          throw new TypeError('Object iterator must return a key-value pair');
         }
-        obj[key = entry[0]] = (dest = obj[key]) ? utils$1.isArray(dest) ? [...dest, entry[1]] : [dest, entry[1]] : entry[1];
+        key = entry[0];
+        if (utils$1.hasOwnProp(obj, key)) {
+          dest = obj[key];
+          obj[key] = utils$1.isArray(dest) ? [...dest, entry[1]] : [dest, entry[1]];
+        } else {
+          obj[key] = entry[1];
+        }
       }
       setHeaders(obj, valueOrRewrite);
     } else {
@@ -42431,7 +43113,19 @@ function redactConfig(config, redactKeys) {
 class AxiosError extends Error {
   static from(error, code, config, request, response, customProps) {
     const axiosError = new AxiosError(error.message, code || error.code, config, request, response);
-    axiosError.cause = error;
+    // Match native `Error` `cause` semantics: non-enumerable. The wrapped
+    // error often carries circular internals (sockets, requests, agents), so
+    // an enumerable `cause` makes structured loggers (pino/winston) and any
+    // own-property walk throw "Converting circular structure to JSON".
+    // Regression from #6982; see #7205. `__proto__: null` mirrors the
+    // `message` descriptor below (prototype-pollution-safe descriptor).
+    Object.defineProperty(axiosError, 'cause', {
+      __proto__: null,
+      value: error,
+      writable: true,
+      enumerable: false,
+      configurable: true
+    });
     axiosError.name = error.name;
 
     // Preserve status from the original error if not already set from response
@@ -42521,6 +43215,10 @@ AxiosError.ERR_CANCELED = 'ERR_CANCELED';
 AxiosError.ERR_NOT_SUPPORT = 'ERR_NOT_SUPPORT';
 AxiosError.ERR_INVALID_URL = 'ERR_INVALID_URL';
 AxiosError.ERR_FORM_DATA_DEPTH_EXCEEDED = 'ERR_FORM_DATA_DEPTH_EXCEEDED';
+
+// Default nesting limit shared with the inverse transform (formDataToJSON) so
+// the FormData <-> JSON round-trip stays symmetric.
+const DEFAULT_FORM_DATA_MAX_DEPTH = 100;
 
 /**
  * Determines if the given thing is a array or js object.
@@ -42622,8 +43320,9 @@ function toFormData(obj, formData, options) {
   const dots = options.dots;
   const indexes = options.indexes;
   const _Blob = options.Blob || typeof Blob !== 'undefined' && Blob;
-  const maxDepth = options.maxDepth === undefined ? 100 : options.maxDepth;
+  const maxDepth = options.maxDepth === undefined ? DEFAULT_FORM_DATA_MAX_DEPTH : options.maxDepth;
   const useBlob = _Blob && utils$1.isSpecCompliantForm(formData);
+  const stack = [];
   if (!utils$1.isFunction(visitor)) {
     throw new TypeError('visitor must be a function');
   }
@@ -42639,9 +43338,37 @@ function toFormData(obj, formData, options) {
       throw new AxiosError('Blob is not supported. Use a Buffer instead.');
     }
     if (utils$1.isArrayBuffer(value) || utils$1.isTypedArray(value)) {
-      return useBlob && typeof Blob === 'function' ? new Blob([value]) : Buffer.from(value);
+      if (useBlob && typeof _Blob === 'function') {
+        return new _Blob([value]);
+      }
+      if (typeof Buffer !== 'undefined') {
+        return Buffer.from(value);
+      }
+      throw new AxiosError('Blob is not supported. Use a Buffer instead.', AxiosError.ERR_NOT_SUPPORT);
     }
     return value;
+  }
+  function throwIfMaxDepthExceeded(depth) {
+    if (depth > maxDepth) {
+      throw new AxiosError('Object is too deeply nested (' + depth + ' levels). Max depth: ' + maxDepth, AxiosError.ERR_FORM_DATA_DEPTH_EXCEEDED);
+    }
+  }
+  function stringifyWithDepthLimit(value, depth) {
+    if (maxDepth === Infinity) {
+      return JSON.stringify(value);
+    }
+    const ancestors = [];
+    return JSON.stringify(value, function limitDepth(_key, currentValue) {
+      if (!utils$1.isObject(currentValue)) {
+        return currentValue;
+      }
+      while (ancestors.length && ancestors[ancestors.length - 1] !== this) {
+        ancestors.pop();
+      }
+      ancestors.push(currentValue);
+      throwIfMaxDepthExceeded(depth + ancestors.length - 1);
+      return currentValue;
+    });
   }
 
   /**
@@ -42665,7 +43392,7 @@ function toFormData(obj, formData, options) {
         // eslint-disable-next-line no-param-reassign
         key = metaTokens ? key : key.slice(0, -2);
         // eslint-disable-next-line no-param-reassign
-        value = JSON.stringify(value);
+        value = stringifyWithDepthLimit(value, 1);
       } else if (utils$1.isArray(value) && isFlatArray(value) || (utils$1.isFileList(value) || utils$1.endsWith(key, '[]')) && (arr = utils$1.toArray(value))) {
         // eslint-disable-next-line no-param-reassign
         key = removeBrackets(key);
@@ -42683,7 +43410,6 @@ function toFormData(obj, formData, options) {
     formData.append(renderKey(path, key, dots), convertValue(value));
     return false;
   }
-  const stack = [];
   const exposedHelpers = Object.assign(predicates, {
     defaultVisitor,
     convertValue,
@@ -42691,11 +43417,9 @@ function toFormData(obj, formData, options) {
   });
   function build(value, path, depth = 0) {
     if (utils$1.isUndefined(value)) return;
-    if (depth > maxDepth) {
-      throw new AxiosError('Object is too deeply nested (' + depth + ' levels). Max depth: ' + maxDepth, AxiosError.ERR_FORM_DATA_DEPTH_EXCEEDED);
-    }
+    throwIfMaxDepthExceeded(depth);
     if (stack.indexOf(value) !== -1) {
-      throw Error('Circular reference detected in ' + path.join('.'));
+      throw new Error('Circular reference detected in ' + path.join('.'));
     }
     stack.push(value);
     utils$1.forEach(value, function each(el, key) {
@@ -42752,9 +43476,7 @@ prototype.append = function append(name, value) {
   this._pairs.push([name, value]);
 };
 prototype.toString = function toString(encoder) {
-  const _encode = encoder ? function (value) {
-    return encoder.call(this, value, encode$1);
-  } : encode$1;
+  const _encode = encoder ? value => encoder.call(this, value, encode$1) : encode$1;
   return this._pairs.map(function each(pair) {
     return _encode(pair[0]) + '=' + _encode(pair[1]);
   }, '').join('&');
@@ -42785,11 +43507,16 @@ function buildURL(url, params, options) {
   if (!params) {
     return url;
   }
-  const _encode = options && options.encode || encode;
+  url = url || '';
   const _options = utils$1.isFunction(options) ? {
     serialize: options
   } : options;
-  const serializeFn = _options && _options.serialize;
+
+  // Read serializer options pollution-safely: own properties and methods on a
+  // class/template prototype are honored, but values injected onto a polluted
+  // Object.prototype are ignored.
+  const _encode = utils$1.getSafeProp(_options, 'encode') || encode;
+  const serializeFn = utils$1.getSafeProp(_options, 'serialize');
   let serializedParams;
   if (serializeFn) {
     serializedParams = serializeFn(params, _options);
@@ -42877,7 +43604,9 @@ var transitionalDefaults = {
   silentJSONParsing: true,
   forcedJSONParsing: true,
   clarifyTimeoutError: false,
-  legacyInterceptorReqResOrdering: true
+  legacyInterceptorReqResOrdering: true,
+  advertiseZstdAcceptEncoding: false,
+  validateStatusUndefinedResolves: true
 };
 
 var URLSearchParams = url.URLSearchParams;
@@ -42978,6 +43707,13 @@ function toURLEncodedForm(data, options) {
   });
 }
 
+const MAX_DEPTH = DEFAULT_FORM_DATA_MAX_DEPTH;
+function throwIfDepthExceeded(index) {
+  if (index > MAX_DEPTH) {
+    throw new AxiosError('FormData field is too deeply nested (' + index + ' levels). Max depth: ' + MAX_DEPTH, AxiosError.ERR_FORM_DATA_DEPTH_EXCEEDED);
+  }
+}
+
 /**
  * It takes a string like `foo[x][y][z]` and returns an array like `['foo', 'x', 'y', 'z']
  *
@@ -42990,9 +43726,14 @@ function parsePropPath(name) {
   // foo.x.y.z
   // foo-x-y-z
   // foo x y z
-  return utils$1.matchAll(/\w+|\[(\w*)]/g, name).map(match => {
-    return match[0] === '[]' ? '' : match[1] || match[0];
-  });
+  const path = [];
+  const pattern = /\w+|\[(\w*)]/g;
+  let match;
+  while ((match = pattern.exec(name)) !== null) {
+    throwIfDepthExceeded(path.length);
+    path.push(match[0] === '[]' ? '' : match[1] || match[0]);
+  }
+  return path;
 }
 
 /**
@@ -43024,6 +43765,7 @@ function arrayToObject(arr) {
  */
 function formDataToJSON(formData) {
   function buildPath(path, value, target, index) {
+    throwIfDepthExceeded(index);
     let name = path[index++];
     if (name === '__proto__') return true;
     const isNumericKey = Number.isFinite(+name);
@@ -43037,7 +43779,7 @@ function formDataToJSON(formData) {
       }
       return !isNumericKey;
     }
-    if (!target[name] || !utils$1.isObject(target[name])) {
+    if (!utils$1.hasOwnProp(target, name) || !utils$1.isObject(target[name])) {
       target[name] = [];
     }
     const result = buildPath(path, value, target[name], index);
@@ -43264,6 +44006,24 @@ function combineURLs(baseURL, relativeURL) {
   return relativeURL ? baseURL.replace(/\/?\/$/, '') + '/' + relativeURL.replace(/^\/+/, '') : baseURL;
 }
 
+const malformedHttpProtocol = /^https?:(?!\/\/)/i;
+const httpProtocolControlCharacters = /[\t\n\r]/g;
+function stripLeadingC0ControlOrSpace(url) {
+  let i = 0;
+  while (i < url.length && url.charCodeAt(i) <= 0x20) {
+    i++;
+  }
+  return url.slice(i);
+}
+function normalizeURLForProtocolCheck(url) {
+  return stripLeadingC0ControlOrSpace(url).replace(httpProtocolControlCharacters, '');
+}
+function assertValidHttpProtocolURL(url, config) {
+  if (typeof url === 'string' && malformedHttpProtocol.test(normalizeURLForProtocolCheck(url))) {
+    throw new AxiosError('Invalid URL: missing "//" after protocol', AxiosError.ERR_INVALID_URL, config);
+  }
+}
+
 /**
  * Creates a new URL by combining the baseURL with the requestedURL,
  * only when the requestedURL is not already an absolute URL.
@@ -43274,9 +44034,11 @@ function combineURLs(baseURL, relativeURL) {
  *
  * @returns {string} The combined full path
  */
-function buildFullPath(baseURL, requestedURL, allowAbsoluteUrls) {
+function buildFullPath(baseURL, requestedURL, allowAbsoluteUrls, config) {
+  assertValidHttpProtocolURL(requestedURL, config);
   let isRelativeUrl = !isAbsoluteURL(requestedURL);
   if (baseURL && (isRelativeUrl || allowAbsoluteUrls === false)) {
+    assertValidHttpProtocolURL(baseURL, config);
     return combineURLs(baseURL, requestedURL);
   }
   return requestedURL;
@@ -43378,14 +44140,16 @@ function getEnv(key) {
   return process.env[key.toLowerCase()] || process.env[key.toUpperCase()] || '';
 }
 
-const VERSION = "1.16.0";
+const VERSION = "1.18.1";
 
 function parseProtocol(url) {
   const match = /^([-+\w]{1,25}):(?:\/\/)?/.exec(url);
   return match && match[1] || '';
 }
 
-const DATA_URL_PATTERN = /^(?:([^;]+);)?(?:[^;]+;)?(base64|),([\s\S]*)$/;
+// RFC 2397: data:[<mediatype>][;base64],<data>
+// mediatype = type/subtype followed by optional ;name=value parameters
+const DATA_URL_PATTERN = /^([^,;]+\/[^,;]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
 
 /**
  * Parse data uri to a Buffer or Blob
@@ -43409,10 +44173,20 @@ function fromDataURI(uri, asBlob, options) {
     if (!match) {
       throw new AxiosError('Invalid URL', AxiosError.ERR_INVALID_URL);
     }
-    const mime = match[1];
-    const isBase64 = match[2];
-    const body = match[3];
-    const buffer = Buffer.from(decodeURIComponent(body), isBase64 ? 'base64' : 'utf8');
+    const type = match[1];
+    const params = match[2];
+    const encoding = match[3] ? 'base64' : 'utf8';
+    const body = match[4];
+
+    // RFC 2397 section 3: default mediatype is text/plain;charset=US-ASCII
+    // Bare `data:,` leaves mime undefined; Blob normalises that to "" per spec.
+    let mime = '';
+    if (type) {
+      mime = params ? type + params : type;
+    } else if (params) {
+      mime = 'text/plain' + params;
+    }
+    const buffer = encoding === 'base64' ? Buffer.from(body, 'base64') : Buffer.from(decodeURIComponent(body), encoding);
     if (asBlob) {
       if (!_Blob) {
         throw new AxiosError('Blob is not supported', AxiosError.ERR_NOT_SUPPORT);
@@ -43605,10 +44379,10 @@ const formDataToStream = (form, headersHandler, options) => {
     boundary = tag + '-' + platform.generateString(size, BOUNDARY_ALPHABET)
   } = options || {};
   if (!utils$1.isFormData(form)) {
-    throw TypeError('FormData instance required');
+    throw new TypeError('FormData instance required');
   }
   if (boundary.length < 1 || boundary.length > 70) {
-    throw Error('boundary must be 1-70 characters long');
+    throw new Error('boundary must be 1-70 characters long');
   }
   const boundaryBytes = textEncoder.encode('--' + boundary + CRLF);
   const footerBytes = textEncoder.encode('--' + boundary + '--' + CRLF);
@@ -43658,6 +44432,84 @@ class ZlibHeaderTransformStream extends stream.Transform {
   }
 }
 
+class Http2Sessions {
+  constructor() {
+    this.sessions = Object.create(null);
+  }
+  getSession(authority, options) {
+    options = Object.assign({
+      sessionTimeout: 1000
+    }, options);
+    let authoritySessions = this.sessions[authority];
+    if (authoritySessions) {
+      let len = authoritySessions.length;
+      for (let i = 0; i < len; i++) {
+        const [sessionHandle, sessionOptions] = authoritySessions[i];
+        if (!sessionHandle.destroyed && !sessionHandle.closed && util.isDeepStrictEqual(sessionOptions, options)) {
+          return sessionHandle;
+        }
+      }
+    }
+    const session = http2.connect(authority, options);
+    let removed;
+    let timer;
+    const removeSession = () => {
+      if (removed) {
+        return;
+      }
+      removed = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      let entries = authoritySessions,
+        len = entries.length,
+        i = len;
+      while (i--) {
+        if (entries[i][0] === session) {
+          if (len === 1) {
+            delete this.sessions[authority];
+          } else {
+            entries.splice(i, 1);
+          }
+          if (!session.closed) {
+            session.close();
+          }
+          return;
+        }
+      }
+    };
+    const originalRequestFn = session.request;
+    const {
+      sessionTimeout
+    } = options;
+    if (sessionTimeout != null) {
+      let streamsCount = 0;
+      session.request = function () {
+        const stream = originalRequestFn.apply(this, arguments);
+        streamsCount++;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        stream.once('close', () => {
+          if (! --streamsCount) {
+            timer = setTimeout(() => {
+              timer = null;
+              removeSession();
+            }, sessionTimeout);
+          }
+        });
+        return stream;
+      };
+    }
+    session.once('close', removeSession);
+    let entry = [session, options];
+    authoritySessions ? authoritySessions.push(entry) : authoritySessions = this.sessions[authority] = [entry];
+    return session;
+  }
+}
+
 const callbackify = (fn, reducer) => {
   return utils$1.isAsyncFn(fn) ? function (...args) {
     const cb = args.pop();
@@ -43671,12 +44523,33 @@ const callbackify = (fn, reducer) => {
   } : fn;
 };
 
-const LOOPBACK_HOSTNAMES = new Set(['localhost']);
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '0.0.0.0']);
 const isIPv4Loopback = host => {
   const parts = host.split('.');
   if (parts.length !== 4) return false;
   if (parts[0] !== '127') return false;
   return parts.every(p => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+};
+const isIPv6ZeroGroup = group => /^0{1,4}$/.test(group);
+
+// The unspecified address (IPv4 0.0.0.0 / IPv6 ::) resolves to the local host
+// for outbound connections, so treat it as loopback-equivalent for NO_PROXY
+// matching. 0.0.0.0 is covered by LOOPBACK_HOSTNAMES; this handles compressed
+// and full IPv6 all-zero forms so both families bypass symmetrically.
+const isIPv6Unspecified = host => {
+  if (host === '::') return true;
+  const compressionIndex = host.indexOf('::');
+  if (compressionIndex !== -1) {
+    if (compressionIndex !== host.lastIndexOf('::')) return false;
+    const left = host.slice(0, compressionIndex);
+    const right = host.slice(compressionIndex + 2);
+    const leftGroups = left ? left.split(':') : [];
+    const rightGroups = right ? right.split(':') : [];
+    const explicitGroups = leftGroups.length + rightGroups.length;
+    return explicitGroups < 8 && leftGroups.every(isIPv6ZeroGroup) && rightGroups.every(isIPv6ZeroGroup);
+  }
+  const groups = host.split(':');
+  return groups.length === 8 && groups.every(isIPv6ZeroGroup);
 };
 const isIPv6Loopback = host => {
   // Collapse all-zero groups: any form of ::1 / 0:0:...:0:1
@@ -43710,6 +44583,7 @@ const isLoopback = host => {
   if (!host) return false;
   if (LOOPBACK_HOSTNAMES.has(host)) return true;
   if (isIPv4Loopback(host)) return true;
+  if (isIPv6Unspecified(host)) return true;
   return isIPv6Loopback(host);
 };
 const DEFAULT_PORTS = {
@@ -43892,6 +44766,9 @@ const progressEventReducer = (listener, isDownloadStream, freq = 3) => {
   let bytesNotified = 0;
   const _speedometer = speedometer(50, 250);
   return throttle(e => {
+    if (!e || typeof e.loaded !== 'number') {
+      return;
+    }
     const rawLoaded = e.loaded;
     const total = e.lengthComputable ? e.total : undefined;
     const loaded = total != null ? Math.min(rawLoaded, total) : rawLoaded;
@@ -43926,11 +44803,13 @@ const asyncDecorator = fn => (...args) => utils$1.asap(() => fn(...args));
  * Estimate decoded byte length of a data:// URL *without* allocating large buffers.
  * - For base64: compute exact decoded size using length and padding;
  *               handle %XX at the character-count level (no string allocation).
- * - For non-base64: use UTF-8 byteLength of the encoded body as a safe upper bound.
+ * - For non-base64: compute the exact percent-decoded UTF-8 byte length.
  *
  * @param {string} url
  * @returns {number}
  */
+const isHexDigit = charCode => charCode >= 48 && charCode <= 57 || charCode >= 65 && charCode <= 70 || charCode >= 97 && charCode <= 102;
+const isPercentEncodedByte = (str, i, len) => i + 2 < len && isHexDigit(str.charCodeAt(i + 1)) && isHexDigit(str.charCodeAt(i + 2));
 function estimateDataURLDecodedBytes(url) {
   if (!url || typeof url !== 'string') return 0;
   if (!url.startsWith('data:')) return 0;
@@ -43947,7 +44826,7 @@ function estimateDataURLDecodedBytes(url) {
       if (body.charCodeAt(i) === 37 /* '%' */ && i + 2 < len) {
         const a = body.charCodeAt(i + 1);
         const b = body.charCodeAt(i + 2);
-        const isHex = (a >= 48 && a <= 57 || a >= 65 && a <= 70 || a >= 97 && a <= 102) && (b >= 48 && b <= 57 || b >= 65 && b <= 70 || b >= 97 && b <= 102);
+        const isHex = isHexDigit(a) && isHexDigit(b);
         if (isHex) {
           effectiveLen -= 2;
           i += 2;
@@ -43982,18 +44861,18 @@ function estimateDataURLDecodedBytes(url) {
     const bytes = groups * 3 - (pad || 0);
     return bytes > 0 ? bytes : 0;
   }
-  if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') {
-    return Buffer.byteLength(body, 'utf8');
-  }
 
   // Compute UTF-8 byte length directly from UTF-16 code units without allocating
   // a byte buffer (TextEncoder.encode would defeat the DoS guard on large bodies).
-  // Using body.length here would undercount non-ASCII (e.g. '€' is 1 code unit
-  // but 3 UTF-8 bytes).
+  // Valid %XX triplets count as one decoded byte; this matches the bytes that
+  // decodeURIComponent(body) would produce before Buffer re-encodes the string.
   let bytes = 0;
   for (let i = 0, len = body.length; i < len; i++) {
     const c = body.charCodeAt(i);
-    if (c < 0x80) {
+    if (c === 37 /* '%' */ && isPercentEncodedByte(body, i, len)) {
+      bytes += 1;
+      i += 2;
+    } else if (c < 0x80) {
       bytes += 1;
     } else if (c < 0x800) {
       bytes += 2;
@@ -44020,7 +44899,14 @@ const brotliOptions = {
   flush: zlib.constants.BROTLI_OPERATION_FLUSH,
   finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH
 };
+const zstdOptions = {
+  flush: zlib.constants.ZSTD_e_flush,
+  finishFlush: zlib.constants.ZSTD_e_flush
+};
 const isBrotliSupported = utils$1.isFunction(zlib.createBrotliDecompress);
+const isZstdSupported = utils$1.isFunction(zlib.createZstdDecompress);
+const ACCEPT_ENCODING = 'gzip, compress, deflate' + (isBrotliSupported ? ', br' : '');
+const ACCEPT_ENCODING_WITH_ZSTD = ACCEPT_ENCODING + (isZstdSupported ? ', zstd' : '');
 const {
   http: httpFollow,
   https: httpsFollow
@@ -44043,6 +44929,78 @@ function setFormDataHeaders$1(headers, formHeaders, policy) {
 // the request currently owning that socket across keep-alive reuse (issue #10780).
 const kAxiosSocketListener = Symbol('axios.http.socketListener');
 const kAxiosCurrentReq = Symbol('axios.http.currentReq');
+
+// Tags HttpsProxyAgent instances installed by setProxy() so the redirect path
+// can strip them without clobbering a user-supplied agent that happens to be
+// an HttpsProxyAgent.
+const kAxiosInstalledTunnel = Symbol('axios.http.installedTunnel');
+
+// Cache of CONNECT-tunneling agents keyed by proxy config so repeat requests
+// through the same proxy reuse a single agent (and its socket pool). The
+// keyspace is bounded by the set of distinct proxy configs the process uses,
+// so unbounded growth is not a concern in practice.
+const tunnelingAgentCache = new Map();
+const tunnelingAgentCacheUser = new WeakMap();
+// Minimum minor versions where Node's HTTP Agent supports native proxyEnv
+// handling. Checking the selected agent below also covers startup modes such
+// as NODE_OPTIONS=--use-env-proxy and --no-use-env-proxy precedence.
+const NODE_NATIVE_ENV_PROXY_SUPPORT = {
+  22: 21,
+  24: 5
+};
+function isNodeNativeEnvProxySupported(nodeVersion = process.versions && process.versions.node) {
+  if (!nodeVersion) {
+    return false;
+  }
+  const [major, minor] = nodeVersion.split('.').map(part => Number(part));
+  if (!Number.isInteger(major) || !Number.isInteger(minor)) {
+    return false;
+  }
+  if (major > 24) {
+    return true;
+  }
+  return NODE_NATIVE_ENV_PROXY_SUPPORT[major] != null && minor >= NODE_NATIVE_ENV_PROXY_SUPPORT[major];
+}
+function isNodeEnvProxyEnabled(agent, nodeVersion = process.versions && process.versions.node) {
+  if (!isNodeNativeEnvProxySupported(nodeVersion)) {
+    return false;
+  }
+  const agentOptions = agent && agent.options;
+  return Boolean(agentOptions && utils$1.hasOwnProp(agentOptions, 'proxyEnv') && agentOptions.proxyEnv != null);
+}
+function getProxyEnvAgent(options, configHttpAgent, configHttpsAgent) {
+  return isHttps.test(options.protocol) ? configHttpsAgent || https.globalAgent : configHttpAgent || http.globalAgent;
+}
+function getTunnelingAgent(agentOptions, userHttpsAgent) {
+  const key = agentOptions.protocol + '//' + agentOptions.hostname + ':' + (agentOptions.port || '') + '#' + (agentOptions.auth || '');
+  const cache = userHttpsAgent ? tunnelingAgentCacheUser.get(userHttpsAgent) || tunnelingAgentCacheUser.set(userHttpsAgent, new Map()).get(userHttpsAgent) : tunnelingAgentCache;
+  let agent = cache.get(key);
+  if (agent) return agent;
+  // Forward the user's TLS options (custom CA, rejectUnauthorized, client cert,
+  // etc.) into the tunneling agent so they apply to the origin TLS upgrade
+  // performed after CONNECT. Our proxy fields take precedence on conflict.
+  const merged = userHttpsAgent && userHttpsAgent.options ? {
+    ...userHttpsAgent.options,
+    ...agentOptions
+  } : agentOptions;
+  agent = new HttpsProxyAgent(merged);
+  if (userHttpsAgent && userHttpsAgent.options) {
+    const originTLSOptions = {
+      ...userHttpsAgent.options
+    };
+    const callback = agent.callback;
+    agent.callback = function axiosTunnelingAgentCallback(req, opts) {
+      // HttpsProxyAgent v5 reads callback opts for the post-CONNECT origin TLS upgrade.
+      return callback.call(this, req, {
+        ...originTLSOptions,
+        ...opts
+      });
+    };
+  }
+  agent[kAxiosInstalledTunnel] = true;
+  cache.set(key, agent);
+  return agent;
+}
 const supportedProtocols = platform.protocols.map(protocol => {
   return protocol + ':';
 });
@@ -44051,7 +45009,7 @@ const supportedProtocols = platform.protocols.map(protocol => {
 // Decode before composing the `auth` option so credentials such as
 // `my%40email.com:pass` are sent as `my@email.com:pass`. Falls back to the
 // original value for malformed input so a bad encoding never throws.
-const decodeURIComponentSafe = value => {
+const decodeURIComponentSafe$1 = value => {
   if (!utils$1.isString(value)) {
     return value;
   }
@@ -44065,84 +45023,11 @@ const flushOnFinish = (stream, [throttled, flush]) => {
   stream.on('end', flush).on('error', flush);
   return throttled;
 };
-class Http2Sessions {
-  constructor() {
-    this.sessions = Object.create(null);
-  }
-  getSession(authority, options) {
-    options = Object.assign({
-      sessionTimeout: 1000
-    }, options);
-    let authoritySessions = this.sessions[authority];
-    if (authoritySessions) {
-      let len = authoritySessions.length;
-      for (let i = 0; i < len; i++) {
-        const [sessionHandle, sessionOptions] = authoritySessions[i];
-        if (!sessionHandle.destroyed && !sessionHandle.closed && util.isDeepStrictEqual(sessionOptions, options)) {
-          return sessionHandle;
-        }
-      }
-    }
-    const session = http2.connect(authority, options);
-    let removed;
-    const removeSession = () => {
-      if (removed) {
-        return;
-      }
-      removed = true;
-      let entries = authoritySessions,
-        len = entries.length,
-        i = len;
-      while (i--) {
-        if (entries[i][0] === session) {
-          if (len === 1) {
-            delete this.sessions[authority];
-          } else {
-            entries.splice(i, 1);
-          }
-          if (!session.closed) {
-            session.close();
-          }
-          return;
-        }
-      }
-    };
-    const originalRequestFn = session.request;
-    const {
-      sessionTimeout
-    } = options;
-    if (sessionTimeout != null) {
-      let timer;
-      let streamsCount = 0;
-      session.request = function () {
-        const stream = originalRequestFn.apply(this, arguments);
-        streamsCount++;
-        if (timer) {
-          clearTimeout(timer);
-          timer = null;
-        }
-        stream.once('close', () => {
-          if (! --streamsCount) {
-            timer = setTimeout(() => {
-              timer = null;
-              removeSession();
-            }, sessionTimeout);
-          }
-        });
-        return stream;
-      };
-    }
-    session.once('close', removeSession);
-    let entry = [session, options];
-    authoritySessions ? authoritySessions.push(entry) : authoritySessions = this.sessions[authority] = [entry];
-    return session;
-  }
-}
 const http2Sessions = new Http2Sessions();
 
 /**
- * If the proxy or config beforeRedirects functions are defined, call them with the options
- * object.
+ * If the proxy, auth, sensitive header, or config beforeRedirects functions are defined,
+ * call them with the options object.
  *
  * @param {Object<string, any>} options - The options object that was passed to the request.
  *
@@ -44152,8 +45037,35 @@ function dispatchBeforeRedirect(options, responseDetails, requestDetails) {
   if (options.beforeRedirects.proxy) {
     options.beforeRedirects.proxy(options);
   }
+  if (options.beforeRedirects.auth) {
+    options.beforeRedirects.auth(options);
+  }
+  if (options.beforeRedirects.sensitiveHeaders) {
+    options.beforeRedirects.sensitiveHeaders(options, requestDetails);
+  }
   if (options.beforeRedirects.config) {
     options.beforeRedirects.config(options, responseDetails, requestDetails);
+  }
+}
+function stripMatchingHeaders(headers, sensitiveSet) {
+  if (!headers) {
+    return;
+  }
+  Object.keys(headers).forEach(header => {
+    if (sensitiveSet.has(header.toLowerCase())) {
+      delete headers[header];
+    }
+  });
+}
+function isSameOriginRedirect(redirectOptions, requestDetails) {
+  if (!requestDetails) {
+    return false;
+  }
+  try {
+    return new URL(requestDetails.url).origin === new URL(redirectOptions.href).origin;
+  } catch (e) {
+    // If origin comparison fails, treat the redirect as unsafe.
+    return false;
   }
 }
 
@@ -44166,9 +45078,10 @@ function dispatchBeforeRedirect(options, responseDetails, requestDetails) {
  *
  * @returns {http.ClientRequestArgs}
  */
-function setProxy(options, configProxy, location, isRedirect) {
+function setProxy(options, configProxy, location, isRedirect, configHttpsAgent, configHttpAgent) {
   let proxy = configProxy;
-  if (!proxy && proxy !== false) {
+  const proxyEnvAgent = getProxyEnvAgent(options, configHttpAgent, configHttpsAgent);
+  if (!proxy && proxy !== false && !isNodeEnvProxyEnabled(proxyEnvAgent)) {
     const proxyUrl = getProxyForUrl(location);
     if (proxyUrl) {
       if (!shouldBypassProxy(location)) {
@@ -44186,6 +45099,13 @@ function setProxy(options, configProxy, location, isRedirect) {
         delete options.headers[name];
       }
     }
+  }
+  // Strip any tunneling agent we installed for the previous hop so a redirect
+  // that drops the proxy or crosses an HTTPS↔HTTP boundary doesn't reuse a
+  // stale one. Match on our Symbol marker so a user-supplied HttpsProxyAgent
+  // (which won't carry the marker) is left alone.
+  if (isRedirect && options.agent && options.agent[kAxiosInstalledTunnel]) {
+    options.agent = undefined;
   }
   if (proxy) {
     // Read proxy fields without traversing the prototype chain. URL instances expose
@@ -44219,37 +45139,84 @@ function setProxy(options, configProxy, location, isRedirect) {
           proxy
         });
       }
-      const base64 = Buffer.from(proxyAuth, 'utf8').toString('base64');
-      options.headers['Proxy-Authorization'] = 'Basic ' + base64;
     }
-
-    // Preserve a user-supplied Host header (case-insensitive) so callers can override
-    // the value forwarded to the proxy; otherwise default to the request URL's host.
-    let hasUserHostHeader = false;
-    for (const name of Object.keys(options.headers)) {
-      if (name.toLowerCase() === 'host') {
-        hasUserHostHeader = true;
-        break;
+    const targetIsHttps = isHttps.test(options.protocol);
+    if (targetIsHttps) {
+      // CONNECT-tunneling path for HTTPS targets. Preserves end-to-end TLS to
+      // the origin so the proxy cannot inspect the URL, headers, or body — the
+      // behavior already promised by THREATMODEL.md (T-R9). HttpsProxyAgent
+      // sends Proxy-Authorization on the CONNECT request only, never on the
+      // wrapped TLS request, which is why we don't stamp it onto
+      // options.headers here. If the user already supplied an HttpsProxyAgent,
+      // they own tunneling end-to-end and we leave them alone; otherwise we
+      // install our own tunneling agent and forward their TLS options (if any)
+      // so a custom httpsAgent for cert pinning / rejectUnauthorized still
+      // applies to the origin TLS upgrade.
+      if (!(configHttpsAgent instanceof HttpsProxyAgent)) {
+        const proxyHost = readProxyField('hostname') || readProxyField('host');
+        const proxyPort = readProxyField('port');
+        const rawProxyProtocol = readProxyField('protocol');
+        const normalizedProtocol = rawProxyProtocol ? rawProxyProtocol.includes(':') ? rawProxyProtocol : `${rawProxyProtocol}:` : 'http:';
+        // Bracket IPv6 literals for URL parsing; URL.hostname strips the
+        // brackets again on read so the agent receives the raw form.
+        const proxyHostForURL = proxyHost && proxyHost.includes(':') && !proxyHost.startsWith('[') ? `[${proxyHost}]` : proxyHost;
+        const proxyURL = new URL(`${normalizedProtocol}//${proxyHostForURL}${proxyPort ? ':' + proxyPort : ''}`);
+        const agentOptions = {
+          protocol: proxyURL.protocol,
+          hostname: proxyURL.hostname.replace(/^\[|\]$/g, ''),
+          port: proxyURL.port,
+          auth: proxyAuth && typeof proxyAuth === 'string' ? proxyAuth : undefined
+        };
+        if (proxyURL.protocol === 'https:') {
+          agentOptions.ALPNProtocols = ['http/1.1'];
+        }
+        const tunnelingAgent = getTunnelingAgent(agentOptions, configHttpsAgent);
+        // Set both: `options.agent` is consumed by the native https.request path
+        // (maxRedirects === 0); `options.agents.https` is consumed by
+        // follow-redirects, which ignores `options.agent` when `options.agents`
+        // is present.
+        options.agent = tunnelingAgent;
+        if (options.agents) {
+          options.agents.https = tunnelingAgent;
+        }
       }
-    }
-    if (!hasUserHostHeader) {
-      options.headers.host = options.hostname + (options.port ? ':' + options.port : '');
-    }
-    const proxyHost = readProxyField('hostname') || readProxyField('host');
-    options.hostname = proxyHost;
-    // Replace 'host' since options is not a URL object
-    options.host = proxyHost;
-    options.port = readProxyField('port');
-    options.path = location;
-    const proxyProtocol = readProxyField('protocol');
-    if (proxyProtocol) {
-      options.protocol = proxyProtocol.includes(':') ? proxyProtocol : `${proxyProtocol}:`;
+    } else {
+      // Forward-proxy mode for plaintext HTTP targets. The request line carries
+      // the absolute URL and the proxy sees everything — acceptable for plain
+      // HTTP since the wire was already plaintext.
+      if (proxyAuth) {
+        const base64 = Buffer.from(proxyAuth, 'utf8').toString('base64');
+        options.headers['Proxy-Authorization'] = 'Basic ' + base64;
+      }
+
+      // Preserve a user-supplied Host header (case-insensitive) so callers can override
+      // the value forwarded to the proxy; otherwise default to the request URL's host.
+      let hasUserHostHeader = false;
+      for (const name of Object.keys(options.headers)) {
+        if (name.toLowerCase() === 'host') {
+          hasUserHostHeader = true;
+          break;
+        }
+      }
+      if (!hasUserHostHeader) {
+        options.headers.host = options.hostname + (options.port ? ':' + options.port : '');
+      }
+      const proxyHost = readProxyField('hostname') || readProxyField('host');
+      options.hostname = proxyHost;
+      // Replace 'host' since options is not a URL object
+      options.host = proxyHost;
+      options.port = readProxyField('port');
+      options.path = location;
+      const proxyProtocol = readProxyField('protocol');
+      if (proxyProtocol) {
+        options.protocol = proxyProtocol.includes(':') ? proxyProtocol : `${proxyProtocol}:`;
+      }
     }
   }
   options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
     // Configure proxy for redirected request, passing the original config proxy to apply
     // the exact same logic as if the redirected request was performed by axios directly.
-    setProxy(redirectOptions, configProxy, redirectOptions.href, true);
+    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent, configHttpAgent);
   };
 }
 const isHttpAdapterSupported = typeof process !== 'undefined' && utils$1.kindOf(process) === 'process';
@@ -44332,16 +45299,30 @@ const http2Transport = {
 /*eslint consistent-return:0*/
 var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
   return wrapAsync(async function dispatchHttpRequest(resolve, reject, onDone) {
-    const own = key => utils$1.hasOwnProp(config, key) ? config[key] : undefined;
+    // Read config pollution-safely: own properties and members inherited from
+    // a non-Object.prototype source (e.g. an Object.create(defaults) template)
+    // are honored, but values injected onto a polluted Object.prototype are
+    // ignored. All behavior-affecting reads in this adapter go through own()
+    // so the protection boundary stays consistent.
+    const own = key => utils$1.getSafeProp(config, key);
+    const transitional = own('transitional') || transitionalDefaults;
     let data = own('data');
     let lookup = own('lookup');
     let family = own('family');
     let httpVersion = own('httpVersion');
     if (httpVersion === undefined) httpVersion = 1;
     let http2Options = own('http2Options');
+    const httpAgent = own('httpAgent');
+    const httpsAgent = own('httpsAgent');
+    const configProxy = own('proxy');
     const responseType = own('responseType');
     const responseEncoding = own('responseEncoding');
-    const method = config.method.toUpperCase();
+    const socketPath = own('socketPath');
+    const method = own('method').toUpperCase();
+    const maxRedirects = own('maxRedirects');
+    const maxBodyLength = own('maxBodyLength');
+    const maxContentLength = own('maxContentLength');
+    const decompress = own('decompress');
     let isDone;
     let rejected = false;
     let req;
@@ -44372,7 +45353,7 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
       try {
         abortEmitter.emit('abort', !reason || reason.type ? new CanceledError(null, config, req) : reason);
       } catch (err) {
-        console.warn('emit error', err);
+        // ignore emit errors
       }
     }
     function clearConnectPhaseTimer() {
@@ -44382,10 +45363,11 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
       }
     }
     function createTimeoutError() {
-      let timeoutErrorMessage = config.timeout ? 'timeout of ' + config.timeout + 'ms exceeded' : 'timeout exceeded';
-      const transitional = config.transitional || transitionalDefaults;
-      if (config.timeoutErrorMessage) {
-        timeoutErrorMessage = config.timeoutErrorMessage;
+      const configTimeout = own('timeout');
+      let timeoutErrorMessage = configTimeout ? 'timeout of ' + configTimeout + 'ms exceeded' : 'timeout exceeded';
+      const configTimeoutErrorMessage = own('timeoutErrorMessage');
+      if (configTimeoutErrorMessage) {
+        timeoutErrorMessage = configTimeoutErrorMessage;
       }
       return new AxiosError(timeoutErrorMessage, transitional.clarifyTimeoutError ? AxiosError.ETIMEDOUT : AxiosError.ECONNABORTED, config, req);
     }
@@ -44428,17 +45410,22 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
     });
 
     // Parse url
-    const fullPath = buildFullPath(config.baseURL, config.url, config.allowAbsoluteUrls);
-    const parsed = new URL(fullPath, platform.hasBrowserEnv ? platform.origin : undefined);
+    const fullPath = buildFullPath(own('baseURL'), own('url'), own('allowAbsoluteUrls'), config);
+    // Unix-socket requests (own socketPath) commonly pass a path-only url
+    // like '/foo'; supply a synthetic base so new URL() can still parse it.
+    // Use the own-property value (not config.socketPath) so a polluted
+    // prototype cannot influence URL base selection.
+    const urlBase = socketPath ? 'http://localhost' : platform.hasBrowserEnv ? platform.origin : undefined;
+    const parsed = new URL(fullPath, urlBase);
     const protocol = parsed.protocol || supportedProtocols[0];
     if (protocol === 'data:') {
       // Apply the same semantics as HTTP: only enforce if a finite, non-negative cap is set.
-      if (config.maxContentLength > -1) {
-        // Use the exact string passed to fromDataURI (config.url); fall back to fullPath if needed.
-        const dataUrl = String(config.url || fullPath || '');
+      if (maxContentLength > -1) {
+        // Use the exact string passed to fromDataURI (the configured url); fall back to fullPath if needed.
+        const dataUrl = String(own('url') || fullPath || '');
         const estimated = estimateDataURLDecodedBytes(dataUrl);
-        if (estimated > config.maxContentLength) {
-          return reject(new AxiosError('maxContentLength size of ' + config.maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config));
+        if (estimated > maxContentLength) {
+          return reject(new AxiosError('maxContentLength size of ' + maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config));
         }
       }
       let convertedData;
@@ -44451,7 +45438,7 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
         });
       }
       try {
-        convertedData = fromDataURI(config.url, responseType === 'blob', {
+        convertedData = fromDataURI(own('url'), responseType === 'blob', {
           Blob: config.env && config.env.Blob
         });
       } catch (err) {
@@ -44525,7 +45512,7 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
 
       // Add Content-Length header if data exists
       headers.setContentLength(data.length, false);
-      if (config.maxBodyLength > -1 && data.length > config.maxBodyLength) {
+      if (maxBodyLength > -1 && data.length > maxBodyLength) {
         return reject(new AxiosError('Request body larger than maxBodyLength limit', AxiosError.ERR_BAD_REQUEST, config));
       }
     }
@@ -44552,37 +45539,36 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
     let auth = undefined;
     const configAuth = own('auth');
     if (configAuth) {
-      const username = configAuth.username || '';
-      const password = configAuth.password || '';
+      const username = utils$1.getSafeProp(configAuth, 'username') || '';
+      const password = utils$1.getSafeProp(configAuth, 'password') || '';
       auth = username + ':' + password;
     }
-    if (!auth && parsed.username) {
-      const urlUsername = decodeURIComponentSafe(parsed.username);
-      const urlPassword = decodeURIComponentSafe(parsed.password);
+    if (!auth && (parsed.username || parsed.password)) {
+      const urlUsername = decodeURIComponentSafe$1(parsed.username);
+      const urlPassword = decodeURIComponentSafe$1(parsed.password);
       auth = urlUsername + ':' + urlPassword;
     }
     auth && headers.delete('authorization');
     let path$1;
     try {
-      path$1 = buildURL(parsed.pathname + parsed.search, config.params, config.paramsSerializer).replace(/^\?/, '');
+      path$1 = buildURL(parsed.pathname + parsed.search, own('params'), own('paramsSerializer')).replace(/^\?/, '');
     } catch (err) {
-      const customErr = new Error(err.message);
-      customErr.config = config;
-      customErr.url = config.url;
-      customErr.exists = true;
-      return reject(customErr);
+      return reject(AxiosError.from(err, AxiosError.ERR_BAD_REQUEST, config, null, null, {
+        url: own('url'),
+        exists: true
+      }));
     }
-    headers.set('Accept-Encoding', 'gzip, compress, deflate' + (isBrotliSupported ? ', br' : ''), false);
+    headers.set('Accept-Encoding', utils$1.hasOwnProp(transitional, 'advertiseZstdAcceptEncoding') && transitional.advertiseZstdAcceptEncoding === true ? ACCEPT_ENCODING_WITH_ZSTD : ACCEPT_ENCODING, false);
 
     // Null-prototype to block prototype pollution gadgets on properties read
     // directly by Node's http.request (e.g. insecureHTTPParser, lookup).
     const options = Object.assign(Object.create(null), {
       path: path$1,
       method: method,
-      headers: headers.toJSON(),
+      headers: toByteStringHeaderObject(headers),
       agents: {
-        http: config.httpAgent,
-        https: config.httpsAgent
+        http: httpAgent,
+        https: httpsAgent
       },
       auth,
       protocol,
@@ -44594,52 +45580,105 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
 
     // cacheable-lookup integration hotfix
     !utils$1.isUndefined(lookup) && (options.lookup = lookup);
-    if (config.socketPath) {
-      if (typeof config.socketPath !== 'string') {
+    if (socketPath) {
+      if (typeof socketPath !== 'string') {
         return reject(new AxiosError('socketPath must be a string', AxiosError.ERR_BAD_OPTION_VALUE, config));
       }
-      if (config.allowedSocketPaths != null) {
-        const allowed = Array.isArray(config.allowedSocketPaths) ? config.allowedSocketPaths : [config.allowedSocketPaths];
-        const resolvedSocket = path.resolve(config.socketPath);
+      const allowedSocketPaths = own('allowedSocketPaths');
+      if (allowedSocketPaths != null) {
+        const allowed = Array.isArray(allowedSocketPaths) ? allowedSocketPaths : [allowedSocketPaths];
+        const resolvedSocket = path.resolve(socketPath);
         const isAllowed = allowed.some(entry => typeof entry === 'string' && path.resolve(entry) === resolvedSocket);
         if (!isAllowed) {
-          return reject(new AxiosError(`socketPath "${config.socketPath}" is not permitted by allowedSocketPaths`, AxiosError.ERR_BAD_OPTION_VALUE, config));
+          return reject(new AxiosError(`socketPath "${socketPath}" is not permitted by allowedSocketPaths`, AxiosError.ERR_BAD_OPTION_VALUE, config));
         }
       }
-      options.socketPath = config.socketPath;
+      options.socketPath = socketPath;
     } else {
       options.hostname = parsed.hostname.startsWith('[') ? parsed.hostname.slice(1, -1) : parsed.hostname;
       options.port = parsed.port;
-      setProxy(options, config.proxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path);
+      setProxy(options, configProxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path, false, httpsAgent, httpAgent);
     }
     let transport;
     let isNativeTransport = false;
+    // True only for the follow-redirects transport, which applies
+    // options.maxBodyLength itself. Every other transport (http2, native
+    // http/https, a user-supplied custom transport) needs the explicit
+    // byte-counting pipeline below to enforce maxBodyLength on streamed uploads.
+    let transportEnforcesMaxBodyLength = false;
     const isHttpsRequest = isHttps.test(options.protocol);
-    options.agent = isHttpsRequest ? config.httpsAgent : config.httpAgent;
+    // Don't clobber a CONNECT-tunneling agent installed by setProxy() for an
+    // HTTPS target.
+    if (options.agent == null) {
+      options.agent = isHttpsRequest ? httpsAgent : httpAgent;
+    }
     if (isHttp2) {
       transport = http2Transport;
     } else {
       const configTransport = own('transport');
       if (configTransport) {
         transport = configTransport;
-      } else if (config.maxRedirects === 0) {
+      } else if (maxRedirects === 0) {
         transport = isHttpsRequest ? https : http;
         isNativeTransport = true;
       } else {
-        if (config.maxRedirects) {
-          options.maxRedirects = config.maxRedirects;
+        transportEnforcesMaxBodyLength = true;
+        options.sensitiveHeaders = [];
+        if (maxRedirects) {
+          options.maxRedirects = maxRedirects;
         }
         const configBeforeRedirect = own('beforeRedirect');
         if (configBeforeRedirect) {
           options.beforeRedirects.config = configBeforeRedirect;
         }
+        if (auth) {
+          // Restore HTTP Basic credentials on same-origin redirects only.
+          // follow-redirects >= 1.15.8 strips Authorization on every redirect (see #6929);
+          // cross-origin stripping is the documented mitigation for T-R2 in THREATMODEL.md
+          // and is preserved by deliberately not restoring on origin change.
+          const requestOrigin = parsed.origin;
+          const authToRestore = auth;
+          options.beforeRedirects.auth = function beforeRedirectAuth(redirectOptions) {
+            try {
+              if (new URL(redirectOptions.href).origin === requestOrigin) {
+                redirectOptions.auth = authToRestore;
+              }
+            } catch (e) {
+              // ignore malformed URL: leaving auth stripped is fail-safe
+            }
+          };
+        }
+        const sensitiveHeaders = own('sensitiveHeaders');
+        if (sensitiveHeaders != null) {
+          if (!utils$1.isArray(sensitiveHeaders)) {
+            return reject(new AxiosError('sensitiveHeaders must be an array of strings', AxiosError.ERR_BAD_OPTION_VALUE, config));
+          }
+          const sensitiveSet = new Set();
+          for (const header of sensitiveHeaders) {
+            if (!utils$1.isString(header)) {
+              return reject(new AxiosError('sensitiveHeaders must be an array of strings', AxiosError.ERR_BAD_OPTION_VALUE, config));
+            }
+            sensitiveSet.add(header.toLowerCase());
+          }
+          if (sensitiveSet.size) {
+            options.sensitiveHeaders = Array.from(sensitiveSet);
+            options.beforeRedirects.sensitiveHeaders = function beforeRedirectSensitiveHeaders(redirectOptions, requestDetails) {
+              if (!isSameOriginRedirect(redirectOptions, requestDetails)) {
+                stripMatchingHeaders(redirectOptions.headers, sensitiveSet);
+              }
+            };
+          }
+        }
         transport = isHttpsRequest ? httpsFollow : httpFollow;
       }
     }
-    if (config.maxBodyLength > -1) {
-      options.maxBodyLength = config.maxBodyLength;
+
+    // Set an explicit maxBodyLength option for transports that inspect it.
+    // When maxBodyLength is -1 (default/unlimited), use Infinity so
+    // follow-redirects does not fall back to its own 10MB default.
+    if (maxBodyLength > -1) {
+      options.maxBodyLength = maxBodyLength;
     } else {
-      // follow-redirects does not skip comparison, so it should always succeed for axios -1 unlimited
       options.maxBodyLength = Infinity;
     }
 
@@ -44669,7 +45708,7 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
       const lastRequest = res.req || req;
 
       // if decompress disabled we should not decompress
-      if (config.decompress !== false && res.headers['content-encoding']) {
+      if (decompress !== false && res.headers['content-encoding']) {
         // if no content, but headers still say that it is encoded,
         // remove the header not confuse downstream operations
         if (method === 'HEAD' || res.statusCode === 204) {
@@ -44701,6 +45740,13 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
               streams.push(zlib.createBrotliDecompress(brotliOptions));
               delete res.headers['content-encoding'];
             }
+            break;
+          case 'zstd':
+            if (isZstdSupported) {
+              streams.push(zlib.createZstdDecompress(zstdOptions));
+              delete res.headers['content-encoding'];
+            }
+            break;
         }
       }
       responseStream = streams.length > 1 ? stream.pipeline(streams, utils$1.noop) : streams[0];
@@ -44714,8 +45760,8 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
       if (responseType === 'stream') {
         // Enforce maxContentLength on streamed responses; previously this
         // was applied only to buffered responses.
-        if (config.maxContentLength > -1) {
-          const limit = config.maxContentLength;
+        if (maxContentLength > -1) {
+          const limit = maxContentLength;
           const source = responseStream;
           async function* enforceMaxContentLength() {
             let totalResponseBytes = 0;
@@ -44741,11 +45787,11 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
           totalResponseBytes += chunk.length;
 
           // make sure the content length is not over the maxContentLength if specified
-          if (config.maxContentLength > -1 && totalResponseBytes > config.maxContentLength) {
+          if (maxContentLength > -1 && totalResponseBytes > maxContentLength) {
             // stream.destroy() emit aborted event before calling reject() on Node.js v16
             rejected = true;
             responseStream.destroy();
-            abort(new AxiosError('maxContentLength size of ' + config.maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config, lastRequest));
+            abort(new AxiosError('maxContentLength size of ' + maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config, lastRequest));
           }
         });
         responseStream.on('aborted', function handlerStreamAborted() {
@@ -44808,7 +45854,11 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
     const boundSockets = new Set();
     req.on('socket', function handleRequestSocket(socket) {
       // default interval of sending ack packet is 1 minute
-      socket.setKeepAlive(true, 1000 * 60);
+      // proxy agents (e.g. agent-base) may return a generic Duplex stream
+      // that doesn't have setKeepAlive, so guard before calling
+      if (typeof socket.setKeepAlive === 'function') {
+        socket.setKeepAlive(true, 1000 * 60);
+      }
 
       // Install a single 'error' listener per socket (not per request) to avoid
       // accumulating listeners on pooled keep-alive sockets that get reassigned
@@ -44838,9 +45888,9 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
     });
 
     // Handle request timeout
-    if (config.timeout) {
+    if (own('timeout')) {
       // This is forcing a int timeout to avoid problems if the `req` interface doesn't handle other types.
-      const timeout = parseInt(config.timeout, 10);
+      const timeout = parseInt(own('timeout'), 10);
       if (Number.isNaN(timeout)) {
         abort(new AxiosError('error trying to parse `config.timeout` to int', AxiosError.ERR_BAD_OPTION_VALUE, config, req));
         return;
@@ -44884,12 +45934,13 @@ var httpAdapter = isHttpAdapterSupported && function httpAdapter(config) {
         }
       });
 
-      // Enforce maxBodyLength for streamed uploads on the native http/https
-      // transport (maxRedirects === 0); follow-redirects enforces it on the
-      // other path.
+      // Enforce maxBodyLength for streamed uploads on every transport that
+      // does not apply options.maxBodyLength itself (native http/https, http2,
+      // and user-supplied custom transports). The follow-redirects transport
+      // enforces it on the redirected HTTP/1 path.
       let uploadStream = data;
-      if (config.maxBodyLength > -1 && config.maxRedirects === 0) {
-        const limit = config.maxBodyLength;
+      if (maxBodyLength > -1 && !transportEnforcesMaxBodyLength) {
+        const limit = maxBodyLength;
         let bytesSent = 0;
         uploadStream = stream.pipeline([data, new stream.Transform({
           transform(chunk, _enc, cb) {
@@ -44952,7 +46003,11 @@ var cookies = platform.hasStandardBrowserEnv ?
       const cookie = cookies[i].replace(/^\s+/, '');
       const eq = cookie.indexOf('=');
       if (eq !== -1 && cookie.slice(0, eq) === name) {
-        return decodeURIComponent(cookie.slice(eq + 1));
+        try {
+          return decodeURIComponent(cookie.slice(eq + 1));
+        } catch (e) {
+          return cookie.slice(eq + 1);
+        }
       }
     }
     return null;
@@ -44985,6 +46040,7 @@ const headersToObject = thing => thing instanceof AxiosHeaders ? {
  */
 function mergeConfig(config1, config2) {
   // eslint-disable-next-line no-param-reassign
+  config1 = config1 || {};
   config2 = config2 || {};
 
   // Use a null-prototype object so that downstream reads such as `config.auth`
@@ -45035,6 +46091,23 @@ function mergeConfig(config1, config2) {
     } else if (!utils$1.isUndefined(a)) {
       return getMergedValue(undefined, a);
     }
+  }
+  function getMergedTransitionalOption(prop) {
+    const transitional2 = utils$1.hasOwnProp(config2, 'transitional') ? config2.transitional : undefined;
+    if (!utils$1.isUndefined(transitional2)) {
+      if (utils$1.isPlainObject(transitional2)) {
+        if (utils$1.hasOwnProp(transitional2, prop)) {
+          return transitional2[prop];
+        }
+      } else {
+        return undefined;
+      }
+    }
+    const transitional1 = utils$1.hasOwnProp(config1, 'transitional') ? config1.transitional : undefined;
+    if (utils$1.isPlainObject(transitional1) && utils$1.hasOwnProp(transitional1, prop)) {
+      return transitional1[prop];
+    }
+    return undefined;
   }
 
   // eslint-disable-next-line consistent-return
@@ -45088,6 +46161,13 @@ function mergeConfig(config1, config2) {
     const configValue = merge(a, b, prop);
     utils$1.isUndefined(configValue) && merge !== mergeDirectKeys || (config[prop] = configValue);
   });
+  if (utils$1.hasOwnProp(config2, 'validateStatus') && utils$1.isUndefined(config2.validateStatus) && getMergedTransitionalOption('validateStatusUndefinedResolves') === false) {
+    if (utils$1.hasOwnProp(config1, 'validateStatus')) {
+      config.validateStatus = getMergedValue(undefined, config1.validateStatus);
+    } else {
+      delete config.validateStatus;
+    }
+  }
   return config;
 }
 
@@ -45097,7 +46177,7 @@ function setFormDataHeaders(headers, formHeaders, policy) {
     headers.set(formHeaders);
     return;
   }
-  Object.entries(formHeaders).forEach(([key, val]) => {
+  Object.entries(formHeaders || {}).forEach(([key, val]) => {
     if (FORM_DATA_CONTENT_HEADERS.includes(key.toLowerCase())) {
       headers.set(key, val);
     }
@@ -45112,8 +46192,8 @@ function setFormDataHeaders(headers, formHeaders, policy) {
  *
  * @returns {string} UTF-8 bytes as a Latin-1 string
  */
-const encodeUTF8 = str => encodeURIComponent(str).replace(/%([0-9A-F]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-var resolveConfig = config => {
+const encodeUTF8$1 = str => encodeURIComponent(str).replace(/%([0-9A-F]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+function resolveConfig(config) {
   const newConfig = mergeConfig({}, config);
 
   // Read only own properties to prevent prototype pollution gadgets
@@ -45129,15 +46209,21 @@ var resolveConfig = config => {
   const allowAbsoluteUrls = own('allowAbsoluteUrls');
   const url = own('url');
   newConfig.headers = headers = AxiosHeaders.from(headers);
-  newConfig.url = buildURL(buildFullPath(baseURL, url, allowAbsoluteUrls), config.params, config.paramsSerializer);
+  newConfig.url = buildURL(buildFullPath(baseURL, url, allowAbsoluteUrls, newConfig), own('params'), own('paramsSerializer'));
 
   // HTTP basic authentication
   if (auth) {
-    headers.set('Authorization', 'Basic ' + btoa((auth.username || '') + ':' + (auth.password ? encodeUTF8(auth.password) : '')));
+    const username = utils$1.getSafeProp(auth, 'username') || '';
+    const password = utils$1.getSafeProp(auth, 'password') || '';
+    try {
+      headers.set('Authorization', 'Basic ' + btoa(username + ':' + (password ? encodeUTF8$1(password) : '')));
+    } catch (e) {
+      throw AxiosError.from(e, AxiosError.ERR_BAD_OPTION_VALUE, config);
+    }
   }
   if (utils$1.isFormData(data)) {
-    if (platform.hasStandardBrowserEnv || platform.hasStandardBrowserWebWorkerEnv) {
-      headers.setContentType(undefined); // browser handles it
+    if (platform.hasStandardBrowserEnv || platform.hasStandardBrowserWebWorkerEnv || utils$1.isReactNative(data)) {
+      headers.setContentType(undefined); // browser/web worker/RN handles it
     } else if (utils$1.isFunction(data.getHeaders)) {
       // Node.js FormData (like form-data package)
       setFormDataHeaders(headers, data.getHeaders(), own('formDataHeaderPolicy'));
@@ -45165,7 +46251,7 @@ var resolveConfig = config => {
     }
   }
   return newConfig;
-};
+}
 
 const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 var xhrAdapter = isXHRAdapterSupported && function (config) {
@@ -45287,7 +46373,7 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
 
     // Add headers to the request
     if ('setRequestHeader' in request) {
-      utils$1.forEach(requestHeaders.toJSON(), function setRequestHeader(val, key) {
+      utils$1.forEach(toByteStringHeaderObject(requestHeaders), function setRequestHeader(val, key) {
         request.setRequestHeader(key, val);
       });
     }
@@ -45334,6 +46420,7 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
     const protocol = parseProtocol(_config.url);
     if (protocol && !platform.protocols.includes(protocol)) {
       reject(new AxiosError('Unsupported protocol ' + protocol + ':', AxiosError.ERR_BAD_REQUEST, config));
+      done();
       return;
     }
 
@@ -45343,41 +46430,43 @@ var xhrAdapter = isXHRAdapterSupported && function (config) {
 };
 
 const composeSignals = (signals, timeout) => {
-  const {
-    length
-  } = signals = signals ? signals.filter(Boolean) : [];
-  if (timeout || length) {
-    let controller = new AbortController();
-    let aborted;
-    const onabort = function (reason) {
-      if (!aborted) {
-        aborted = true;
-        unsubscribe();
-        const err = reason instanceof Error ? reason : this.reason;
-        controller.abort(err instanceof AxiosError ? err : new CanceledError(err instanceof Error ? err.message : err));
-      }
-    };
-    let timer = timeout && setTimeout(() => {
-      timer = null;
-      onabort(new AxiosError(`timeout of ${timeout}ms exceeded`, AxiosError.ETIMEDOUT));
-    }, timeout);
-    const unsubscribe = () => {
-      if (signals) {
-        timer && clearTimeout(timer);
-        timer = null;
-        signals.forEach(signal => {
-          signal.unsubscribe ? signal.unsubscribe(onabort) : signal.removeEventListener('abort', onabort);
-        });
-        signals = null;
-      }
-    };
-    signals.forEach(signal => signal.addEventListener('abort', onabort));
-    const {
-      signal
-    } = controller;
-    signal.unsubscribe = () => utils$1.asap(unsubscribe);
-    return signal;
+  signals = signals ? signals.filter(Boolean) : [];
+  if (!timeout && !signals.length) {
+    return;
   }
+  const controller = new AbortController();
+  let aborted = false;
+  const onabort = function (reason) {
+    if (!aborted) {
+      aborted = true;
+      unsubscribe();
+      const err = reason instanceof Error ? reason : this.reason;
+      controller.abort(err instanceof AxiosError ? err : new CanceledError(err instanceof Error ? err.message : err));
+    }
+  };
+  let timer = timeout && setTimeout(() => {
+    timer = null;
+    onabort(new AxiosError(`timeout of ${timeout}ms exceeded`, AxiosError.ETIMEDOUT));
+  }, timeout);
+  const unsubscribe = () => {
+    if (!signals) {
+      return;
+    }
+    timer && clearTimeout(timer);
+    timer = null;
+    signals.forEach(signal => {
+      signal.unsubscribe ? signal.unsubscribe(onabort) : signal.removeEventListener('abort', onabort);
+    });
+    signals = null;
+  };
+  signals.forEach(signal => signal.addEventListener('abort', onabort, {
+    once: true
+  }));
+  const {
+    signal
+  } = controller;
+  signal.unsubscribe = () => utils$1.asap(unsubscribe);
+  return signal;
 };
 
 const streamChunk = function* (chunk, chunkSize) {
@@ -45466,6 +46555,31 @@ const DEFAULT_CHUNK_SIZE = 64 * 1024;
 const {
   isFunction
 } = utils$1;
+
+/**
+ * Encode a UTF-8 string to a Latin-1 byte string for use with btoa().
+ * This is a modern replacement for the deprecated unescape(encodeURIComponent(str)) pattern.
+ *
+ * @param {string} str The string to encode
+ *
+ * @returns {string} UTF-8 bytes as a Latin-1 string
+ */
+const encodeUTF8 = str => encodeURIComponent(str).replace(/%([0-9A-F]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+
+// Node's WHATWG URL parser returns `username` and `password` percent-encoded.
+// Decode before composing the `auth` option so credentials such as
+// `my%40email.com:pass` are sent as `my@email.com:pass`. Falls back to the
+// original value for malformed input so a bad encoding never throws.
+const decodeURIComponentSafe = value => {
+  if (!utils$1.isString(value)) {
+    return value;
+  }
+  try {
+    return decodeURIComponent(value);
+  } catch (error) {
+    return value;
+  }
+};
 const test = (fn, ...args) => {
   try {
     return !!fn(...args);
@@ -45473,9 +46587,16 @@ const test = (fn, ...args) => {
     return false;
   }
 };
+const maybeWithAuthCredentials = url => {
+  const protocolIndex = url.indexOf('://');
+  let urlToCheck = url;
+  if (protocolIndex !== -1) {
+    urlToCheck = urlToCheck.slice(protocolIndex + 3);
+  }
+  return urlToCheck.includes('@') || urlToCheck.includes(':');
+};
 const factory = env => {
-  var _utils$global;
-  const globalObject = (_utils$global = utils$1.global) !== null && _utils$global !== void 0 ? _utils$global : globalThis;
+  const globalObject = utils$1.global !== undefined && utils$1.global !== null ? utils$1.global : globalThis;
   const {
     ReadableStream,
     TextEncoder
@@ -45577,6 +46698,7 @@ const factory = env => {
     } = resolveConfig(config);
     const hasMaxContentLength = utils$1.isNumber(maxContentLength) && maxContentLength > -1;
     const hasMaxBodyLength = utils$1.isNumber(maxBodyLength) && maxBodyLength > -1;
+    const own = key => utils$1.hasOwnProp(config, key) ? config[key] : undefined;
     let _fetch = envFetch || fetch;
     responseType = responseType ? (responseType + '').toLowerCase() : 'text';
     let composedSignal = composeSignals([signal, cancelToken && cancelToken.toAbortSignal()], timeout);
@@ -45585,7 +46707,46 @@ const factory = env => {
       composedSignal.unsubscribe();
     });
     let requestContentLength;
+
+    // AxiosError we raise while the request body is being streamed. Captured
+    // by identity so the catch block can surface it directly, regardless of
+    // how the runtime wraps the resulting fetch rejection (undici exposes it
+    // as `err.cause`; some browsers drop the original error entirely).
+    let pendingBodyError = null;
+    const maxBodyLengthError = () => new AxiosError('Request body larger than maxBodyLength limit', AxiosError.ERR_BAD_REQUEST, config, request);
     try {
+      // HTTP basic authentication
+      let auth = undefined;
+      const configAuth = own('auth');
+      if (configAuth) {
+        const username = utils$1.getSafeProp(configAuth, 'username') || '';
+        const password = utils$1.getSafeProp(configAuth, 'password') || '';
+        auth = {
+          username,
+          password
+        };
+      }
+      if (maybeWithAuthCredentials(url)) {
+        const parsedURL = new URL(url, platform.origin);
+        if (!auth && (parsedURL.username || parsedURL.password)) {
+          const urlUsername = decodeURIComponentSafe(parsedURL.username);
+          const urlPassword = decodeURIComponentSafe(parsedURL.password);
+          auth = {
+            username: urlUsername,
+            password: urlPassword
+          };
+        }
+        if (parsedURL.username || parsedURL.password) {
+          parsedURL.username = '';
+          parsedURL.password = '';
+          url = parsedURL.href;
+        }
+      }
+      if (auth) {
+        headers.delete('authorization');
+        headers.set('Authorization', 'Basic ' + btoa(encodeUTF8((auth.username || '') + ':' + (auth.password || ''))));
+      }
+
       // Enforce maxContentLength for data: URLs up-front so we never materialize
       // an oversized payload. The HTTP adapter applies the same check (see http.js
       // "if (protocol === 'data:')" branch).
@@ -45596,30 +46757,54 @@ const factory = env => {
         }
       }
 
-      // Enforce maxBodyLength against the outbound request body before dispatch.
-      // Mirrors http.js behavior (ERR_BAD_REQUEST / 'Request body larger than
-      // maxBodyLength limit'). Skip when the body length cannot be determined
-      // (e.g. a live ReadableStream supplied by the caller).
+      // Enforce maxBodyLength against known-size bodies before dispatch using
+      // the body's *actual* size — never a caller-declared Content-Length,
+      // which could under-report to slip an oversized body past the check.
+      // Unknown-size streams return undefined here and are counted per-chunk
+      // below as fetch consumes them.
       if (hasMaxBodyLength && method !== 'get' && method !== 'head') {
-        const outboundLength = await resolveBodyLength(headers, data);
-        if (typeof outboundLength === 'number' && isFinite(outboundLength) && outboundLength > maxBodyLength) {
-          throw new AxiosError('Request body larger than maxBodyLength limit', AxiosError.ERR_BAD_REQUEST, config, request);
+        const outboundLength = await getBodyLength(data);
+        if (typeof outboundLength === 'number' && isFinite(outboundLength)) {
+          requestContentLength = outboundLength;
+          if (outboundLength > maxBodyLength) {
+            throw maxBodyLengthError();
+          }
         }
       }
-      if (onUploadProgress && supportsRequestStream && method !== 'get' && method !== 'head' && (requestContentLength = await resolveBodyLength(headers, data)) !== 0) {
-        let _request = new Request(url, {
-          method: 'POST',
-          body: data,
-          duplex: 'half'
-        });
-        let contentTypeHeader;
-        if (utils$1.isFormData(data) && (contentTypeHeader = _request.headers.get('content-type'))) {
-          headers.setContentType(contentTypeHeader);
+
+      // A streamed body under maxBodyLength must be counted as fetch consumes
+      // it; its size is never trusted from a caller-declared Content-Length.
+      const mustEnforceStreamBody = hasMaxBodyLength && (utils$1.isReadableStream(data) || utils$1.isStream(data));
+      const trackRequestStream = (stream, onProgress, flush) => trackStream(stream, DEFAULT_CHUNK_SIZE, loadedBytes => {
+        if (hasMaxBodyLength && loadedBytes > maxBodyLength) {
+          throw pendingBodyError = maxBodyLengthError();
         }
-        if (_request.body) {
-          const [onProgress, flush] = progressEventDecorator(requestContentLength, progressEventReducer(asyncDecorator(onUploadProgress)));
-          data = trackStream(_request.body, DEFAULT_CHUNK_SIZE, onProgress, flush);
+        onProgress && onProgress(loadedBytes);
+      }, flush);
+      if (supportsRequestStream && method !== 'get' && method !== 'head' && (onUploadProgress || mustEnforceStreamBody)) {
+        requestContentLength = requestContentLength == null ? await resolveBodyLength(headers, data) : requestContentLength;
+
+        // A declared length of 0 is only trusted to skip the wrap when we are
+        // not enforcing a stream limit (which must not rely on that header).
+        if (requestContentLength !== 0 || mustEnforceStreamBody) {
+          let _request = new Request(url, {
+            method: 'POST',
+            body: data,
+            duplex: 'half'
+          });
+          let contentTypeHeader;
+          if (utils$1.isFormData(data) && (contentTypeHeader = _request.headers.get('content-type'))) {
+            headers.setContentType(contentTypeHeader);
+          }
+          if (_request.body) {
+            const [onProgress, flush] = onUploadProgress && progressEventDecorator(requestContentLength, progressEventReducer(asyncDecorator(onUploadProgress))) || [];
+            data = trackRequestStream(_request.body, onProgress, flush);
+          }
         }
+      } else if (mustEnforceStreamBody && !isRequestSupported && isReadableStreamSupported && method !== 'get' && method !== 'head') {
+        data = trackRequestStream(data);
+      } else if (mustEnforceStreamBody && isRequestSupported && !supportsRequestStream && method !== 'get' && method !== 'head') {
+        throw new AxiosError('Stream request bodies are not supported by the current fetch implementation', AxiosError.ERR_NOT_SUPPORT, config, request);
       }
       if (!utils$1.isString(withCredentials)) {
         withCredentials = withCredentials ? 'include' : 'omit';
@@ -45644,18 +46829,19 @@ const factory = env => {
         ...fetchOptions,
         signal: composedSignal,
         method: method.toUpperCase(),
-        headers: headers.normalize().toJSON(),
+        headers: toByteStringHeaderObject(headers.normalize()),
         body: data,
         duplex: 'half',
         credentials: isCredentialsSupported ? withCredentials : undefined
       };
       request = isRequestSupported && new Request(url, resolvedOptions);
       let response = await (isRequestSupported ? _fetch(request, fetchOptions) : _fetch(url, resolvedOptions));
+      const responseHeaders = AxiosHeaders.from(response.headers);
 
       // Cheap pre-check: if the server honestly declares a content-length that
       // already exceeds the cap, reject before we start streaming.
       if (hasMaxContentLength) {
-        const declaredLength = utils$1.toFiniteNumber(response.headers.get('content-length'));
+        const declaredLength = utils$1.toFiniteNumber(responseHeaders.getContentLength());
         if (declaredLength != null && declaredLength > maxContentLength) {
           throw new AxiosError('maxContentLength size of ' + maxContentLength + ' exceeded', AxiosError.ERR_BAD_RESPONSE, config, request);
         }
@@ -45666,7 +46852,7 @@ const factory = env => {
         ['status', 'statusText', 'headers'].forEach(prop => {
           options[prop] = response[prop];
         });
-        const responseContentLength = utils$1.toFiniteNumber(response.headers.get('content-length'));
+        const responseContentLength = utils$1.toFiniteNumber(responseHeaders.getContentLength());
         const [onProgress, flush] = onDownloadProgress && progressEventDecorator(responseContentLength, progressEventReducer(asyncDecorator(onDownloadProgress), true)) || [];
         let bytesRead = 0;
         const onChunkProgress = loadedBytes => {
@@ -45725,13 +46911,48 @@ const factory = env => {
         const canceledError = composedSignal.reason;
         canceledError.config = config;
         request && (canceledError.request = request);
-        err !== canceledError && (canceledError.cause = err);
+        if (err !== canceledError) {
+          // Non-enumerable to match native Error `cause` semantics so loggers
+          // don't recurse into circular fetch internals (see #7205).
+          Object.defineProperty(canceledError, 'cause', {
+            __proto__: null,
+            value: err,
+            writable: true,
+            enumerable: false,
+            configurable: true
+          });
+        }
         throw canceledError;
       }
+
+      // Surface a maxBodyLength violation we raised while the request body was
+      // being streamed. Matching by identity (rather than reading
+      // `err.cause.isAxiosError`) keeps the error deterministic across runtimes
+      // and avoids both prototype-pollution reads and mis-attributing a foreign
+      // AxiosError that merely happened to land in `err.cause`.
+      if (pendingBodyError) {
+        request && !pendingBodyError.request && (pendingBodyError.request = request);
+        throw pendingBodyError;
+      }
+
+      // Re-throw AxiosErrors we raised synchronously (data: URL / content-length
+      // pre-checks, response size enforcement) without re-wrapping them.
+      if (err instanceof AxiosError) {
+        request && !err.request && (err.request = request);
+        throw err;
+      }
       if (err && err.name === 'TypeError' && /Load failed|fetch/i.test(err.message)) {
-        throw Object.assign(new AxiosError('Network Error', AxiosError.ERR_NETWORK, config, request, err && err.response), {
-          cause: err.cause || err
+        const networkError = new AxiosError('Network Error', AxiosError.ERR_NETWORK, config, request, err && err.response);
+        // Non-enumerable to match native Error `cause` semantics so loggers
+        // don't recurse into circular fetch internals (see #7205).
+        Object.defineProperty(networkError, 'cause', {
+          __proto__: null,
+          value: err.cause || err,
+          writable: true,
+          enumerable: false,
+          configurable: true
         });
+        throw networkError;
       }
       throw AxiosError.from(err, err && err.code, config, request, err && err.response);
     }
@@ -45850,7 +47071,7 @@ function getAdapter(adapters, config) {
   if (!adapter) {
     const reasons = Object.entries(rejectedReasons).map(([id, state]) => `adapter ${id} ` + (state === false ? 'is not supported by the environment' : 'is not available in the build'));
     let s = length ? reasons.length > 1 ? 'since :\n' + reasons.map(renderReason).join('\n') : ' ' + renderReason(reasons[0]) : 'as no adapter specified';
-    throw new AxiosError(`There is no suitable adapter to dispatch the request ` + s, 'ERR_NOT_SUPPORT');
+    throw new AxiosError(`There is no suitable adapter to dispatch the request ` + s, AxiosError.ERR_NOT_SUPPORT);
   }
   return adapter;
 }
@@ -45993,7 +47214,7 @@ validators$1.spelling = function spelling(correctSpelling) {
  */
 
 function assertOptions(options, schema, allowUnknown) {
-  if (typeof options !== 'object') {
+  if (typeof options !== 'object' || options === null) {
     throw new AxiosError('options must be an object', AxiosError.ERR_BAD_OPTION_VALUE);
   }
   const keys = Object.keys(options);
@@ -46102,7 +47323,9 @@ class Axios {
         silentJSONParsing: validators.transitional(validators.boolean),
         forcedJSONParsing: validators.transitional(validators.boolean),
         clarifyTimeoutError: validators.transitional(validators.boolean),
-        legacyInterceptorReqResOrdering: validators.transitional(validators.boolean)
+        legacyInterceptorReqResOrdering: validators.transitional(validators.boolean),
+        advertiseZstdAcceptEncoding: validators.transitional(validators.boolean),
+        validateStatusUndefinedResolves: validators.transitional(validators.boolean)
       }, false);
     }
     if (paramsSerializer != null) {
@@ -46199,7 +47422,7 @@ class Axios {
   }
   getUri(config) {
     config = mergeConfig(this.defaults, config);
-    const fullPath = buildFullPath(config.baseURL, config.url, config.allowAbsoluteUrls);
+    const fullPath = buildFullPath(config.baseURL, config.url, config.allowAbsoluteUrls, config);
     return buildURL(fullPath, config.params, config.paramsSerializer);
   }
 }
@@ -46211,7 +47434,7 @@ utils$1.forEach(['delete', 'get', 'head', 'options'], function forEachMethodNoDa
     return this.request(mergeConfig(config || {}, {
       method,
       url,
-      data: (config || {}).data
+      data: config && utils$1.hasOwnProp(config, 'data') ? config.data : undefined
     }));
   };
 });
