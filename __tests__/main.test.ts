@@ -1,13 +1,16 @@
 import * as fs from 'fs'
 import * as path from 'path'
-import * as handlers from 'typed-rest-client/Handlers'
+import * as handlers from 'typed-rest-client/Handlers.js'
 import * as io from '@actions/io'
-import * as thc from 'typed-rest-client/HttpClient'
+import * as thc from 'typed-rest-client/HttpClient.js'
+import { fileURLToPath } from 'url'
 
-import { IReleaseDownloadSettings } from '../src/download-settings'
-import { ReleaseDownloader } from '../src/release-downloader'
+import { IReleaseDownloadSettings } from '../src/download-settings.js'
+import { ReleaseDownloader } from '../src/release-downloader.js'
 import nock from 'nock'
-import { extract } from '../src/unarchive'
+import { extract } from '../src/unarchive.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let downloader: ReleaseDownloader
 let httpClent: thc.HttpClient
@@ -25,11 +28,11 @@ beforeEach(() => {
   downloader = new ReleaseDownloader(httpClent, githubApiUrl)
 
   nock('https://api.github.com')
-    .get('/repos/step-security/setup-terraform/releases/latest')
+    .get('/repos/step-security/release-downloader/releases/latest')
     .reply(200, readFromFile('1-release-latest.json'))
 
   nock('https://api.github.com')
-    .get('/repos/step-security/setup-terraform/releases/68092191')
+    .get('/repos/step-security/release-downloader/releases/68092191')
     .reply(200, readFromFile('1-release-latest.json'))
 
   nock('https://api.github.com')
@@ -143,7 +146,7 @@ function normalizeLineEndings(str: string): string {
 
 test('Download all files from public repo', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: true,
     preRelease: false,
     tag: '',
@@ -152,7 +155,8 @@ test('Download all files from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(7)
@@ -160,7 +164,7 @@ test('Download all files from public repo', async () => {
 
 test('Download single file from public repo', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: true,
     preRelease: false,
     tag: '',
@@ -169,7 +173,8 @@ test('Download single file from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -177,7 +182,7 @@ test('Download single file from public repo', async () => {
 
 test('Fail loudly if given filename is not found in a release', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: true,
     preRelease: false,
     tag: '',
@@ -186,17 +191,18 @@ test('Fail loudly if given filename is not found in a release', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = downloader.download(downloadSettings)
   await expect(result).rejects.toThrow(
-    'Asset with name missing-file.txt not found!'
+    "No asset matching 'missing-file.txt' found in release"
   )
 }, 10000)
 
 test('Fail loudly if release is not identified', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: false,
     preRelease: false,
     tag: '',
@@ -205,17 +211,18 @@ test('Fail loudly if release is not identified', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = downloader.download(downloadSettings)
   await expect(result).rejects.toThrow(
-    'Config error: Please input a valid tag or release ID, or specify `latest`'
+    'Please input a valid tag or release ID, or specify `latest`'
   )
 }, 10000)
 
 test('Download files with wildcard from public repo', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: true,
     preRelease: false,
     tag: '',
@@ -224,7 +231,8 @@ test('Download files with wildcard from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(2)
@@ -232,7 +240,7 @@ test('Download files with wildcard from public repo', async () => {
 
 test('Download single file with wildcard from public repo', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: true,
     preRelease: false,
     tag: '',
@@ -241,7 +249,8 @@ test('Download single file with wildcard from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -249,7 +258,7 @@ test('Download single file with wildcard from public repo', async () => {
 
 test('Download multiple pdf files with wildcard filename', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: true,
     preRelease: false,
     tag: '',
@@ -258,7 +267,8 @@ test('Download multiple pdf files with wildcard filename', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(2)
@@ -266,7 +276,7 @@ test('Download multiple pdf files with wildcard filename', async () => {
 
 test('Download a csv file with wildcard filename', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: true,
     preRelease: false,
     tag: '',
@@ -275,7 +285,8 @@ test('Download a csv file with wildcard filename', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -294,7 +305,8 @@ test('Download file from Github Enterprise server', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -302,7 +314,7 @@ test('Download file from Github Enterprise server', async () => {
 
 test('Download file from release identified by ID', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: false,
     preRelease: false,
     tag: '',
@@ -311,7 +323,8 @@ test('Download file from release identified by ID', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -319,7 +332,7 @@ test('Download file from release identified by ID', async () => {
 
 test('Download all archive files from public repo', async () => {
   const downloadSettings: IReleaseDownloadSettings = {
-    sourceRepoPath: 'step-security/setup-terraform',
+    sourceRepoPath: 'step-security/release-downloader',
     isLatest: true,
     preRelease: false,
     tag: '',
@@ -328,7 +341,8 @@ test('Download all archive files from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: true,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   if (downloadSettings.extractAssets) {
@@ -367,11 +381,12 @@ test('Fail when a release with no assets are obtained', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = downloader.download(downloadSettings)
   await expect(result).rejects.toThrow(
-    'No assets found in release Foo app - v1.0.0'
+    "No asset matching 'installer.zip' found in release. Available assets: (no assets in release)"
   )
 }, 10000)
 
@@ -386,7 +401,8 @@ test('Download from latest prerelease', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -403,10 +419,13 @@ test('Fail when a release with no prerelease is obtained', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = downloader.download(downloadSettings)
-  await expect(result).rejects.toThrow('No prereleases found!')
+  await expect(result).rejects.toThrow(
+    "No prereleases found for repository 'foo/slick-pg'"
+  )
 }, 10000)
 
 test('Download from a release containing only tarBall & zipBall', async () => {
@@ -420,7 +439,8 @@ test('Download from a release containing only tarBall & zipBall', async () => {
     tarBall: true,
     zipBall: true,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
 
   const result = await downloader.download(downloadSettings)

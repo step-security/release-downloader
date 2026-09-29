@@ -1,0 +1,13 @@
+{
+  "onboarding_type": "copied",
+  "is_archived": false,
+  "maintained_action_name": "step-security/release-downloader",
+  "upstream_full_action_name": "robinraju/release-downloader",
+  "action_type": "node",
+  "current_version": "v1.13",
+  "sync_config": {
+    "ignore_presets": [
+      "defaults_v1"
+    ]
+  }
+}
