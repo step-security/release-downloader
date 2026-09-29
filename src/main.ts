@@ -1,12 +1,19 @@
 import * as core from '@actions/core'
 import * as fs from 'fs'
-import * as handlers from 'typed-rest-client/Handlers'
-import * as inputHelper from './input-helper'
-import * as thc from 'typed-rest-client/HttpClient'
+import * as handlers from 'typed-rest-client/Handlers.js'
+import * as inputHelper from './input-helper.js'
+import * as thc from 'typed-rest-client/HttpClient.js'
 import axios, { isAxiosError } from 'axios'
 
-import { ReleaseDownloader } from './release-downloader'
-import { extract } from './unarchive'
+import { ReleaseDownloader } from './release-downloader.js'
+import { extract } from './unarchive.js'
+import {
+  AssetNotFoundError,
+  ConfigError,
+  FileNotFoundError,
+  HttpError,
+  ReleaseDownloaderError
+} from './errors.js'
 
 async function validateSubscription(): Promise<void> {
   const eventPath = process.env.GITHUB_EVENT_PATH
@@ -26,7 +33,7 @@ async function validateSubscription(): Promise<void> {
   core.info('\u001b[1;36mStepSecurity Maintained Action\u001b[0m')
   core.info(`Secure drop-in replacement for ${upstream}`)
   if (repoPrivate === false)
-    core.info('\u001b[32m\u2713 Free for public repositories\u001b[0m')
+    core.info('\u001b[32m✓ Free for public repositories\u001b[0m')
   core.info(`\u001b[36mLearn more:\u001b[0m ${docsUrl}`)
   core.info('')
 
@@ -55,7 +62,7 @@ async function validateSubscription(): Promise<void> {
   }
 }
 
-async function run(): Promise<void> {
+export async function run(): Promise<void> {
   try {
     await validateSubscription()
 
@@ -77,16 +84,46 @@ async function run(): Promise<void> {
 
     if (downloadSettings.extractAssets) {
       for (const asset of res) {
-        await extract(asset, downloadSettings.outFilePath)
+        await extract(asset, downloadSettings.extractPath)
       }
     }
 
     core.info(`Done: ${res}`)
   } catch (error) {
-    if (error instanceof Error) {
-      core.setFailed(error.message)
-    }
+    handleError(error)
   }
+}
+
+function handleError(error: unknown): void {
+  if (error instanceof HttpError) {
+    core.error(`HTTP Error: ${error.message}`)
+    core.error(`  URL: ${error.url}`)
+    if (error.statusCode === 401 || error.statusCode === 403) {
+      core.error(`  Hint: Verify the 'token' input has appropriate scopes`)
+    }
+    if (error.statusCode === 404) {
+      core.error(`  Hint: Check that the repository, tag, or release ID exists`)
+    }
+  } else if (error instanceof FileNotFoundError) {
+    core.error(`File Error: ${error.message}`)
+    if (error.hint) core.error(`  Hint: ${error.hint}`)
+  } else if (error instanceof AssetNotFoundError) {
+    core.error(`Asset not found: ${error.message}`)
+    if (error.availableAssets.length > 0) {
+      core.error(`  Available assets: ${error.availableAssets.join(', ')}`)
+    }
+  } else if (error instanceof ConfigError) {
+    core.error(`Configuration Error: ${error.message}`)
+  } else if (error instanceof ReleaseDownloaderError) {
+    core.error(error.message)
+    if (error.stack) core.debug(error.stack)
+  } else if (error instanceof Error) {
+    core.error(error.message)
+    if (error.stack) core.debug(error.stack)
+  } else {
+    core.error(String(error))
+  }
+  core.setFailed(error instanceof Error ? error.message : String(error))
 }
 
 run()
