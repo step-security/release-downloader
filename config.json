@@ -1,0 +1,17 @@
+{
+  "$comment": "Managed automatically when syncing with upstream. Do not edit by hand.",
+  "schema_version": 1,
+  "onboarding_type": "copied",
+  "action_type": "node",
+  "upstream": {
+    "repository": "robinraju/release-downloader",
+    "synced_tag": "v1.13",
+    "synced_commit": "28fc21f50d76778e7023361aa1f863e717d3d56f",
+    "archived": false
+  },
+  "build": {
+    "package_manager": "npm@11.19.0",
+    "node_version": "24",
+    "script": "package"
+  }
+}
