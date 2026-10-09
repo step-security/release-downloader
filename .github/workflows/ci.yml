@@ -5,14 +5,9 @@ on:
   push:
     branches:
       - main
-    tags:
-      - '*'
 
 permissions:
   contents: read
-
-env:
-  RELEASE_DOWNLOADER_TEST_TOKEN: ${{ secrets.RELEASE_DOWNLOADER_TEST_TOKEN }}
 
 jobs:
   build:
