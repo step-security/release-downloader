@@ -42,12 +42,12 @@ test('maps known and fallback HTTP status codes to user-friendly reasons', () =>
 
 test('preserves context on custom error types', () => {
   const baseError = new ReleaseDownloaderError('base failure', {
-    sourceRepoPath: 'robinraju/probable-potato'
+    sourceRepoPath: 'step-security/release-downloader'
   })
   const httpError = new HttpError(
     404,
-    "Fetch latest release for 'robinraju/probable-potato'",
-    'https://api.github.com/repos/robinraju/probable-potato/releases/latest'
+    "Fetch latest release for 'step-security/release-downloader'",
+    'https://api.github.com/repos/step-security/release-downloader/releases/latest'
   )
   const fileError = new FileNotFoundError(
     '/tmp/missing.txt',
@@ -58,10 +58,10 @@ test('preserves context on custom error types', () => {
   const configError = new ConfigError('Invalid inputs')
 
   expect(baseError.context).toEqual({
-    sourceRepoPath: 'robinraju/probable-potato'
+    sourceRepoPath: 'step-security/release-downloader'
   })
   expect(httpError.url).toBe(
-    'https://api.github.com/repos/robinraju/probable-potato/releases/latest'
+    'https://api.github.com/repos/step-security/release-downloader/releases/latest'
   )
   expect(fileError.message).toContain('Check the previous step.')
   expect(assetError.message).toContain('foo.tgz, bar.txt')

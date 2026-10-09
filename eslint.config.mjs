@@ -21,13 +21,9 @@ export default [
       'node_modules/**',
       'test-output/**',
       '*.json',
-<<<<<<< 3eaf78dcfc719d1551a4d535699e01b568536167
-      'eslint.config.mjs'
-=======
       'eslint.config.mjs',
       'jest.config.js',
       'rollup.config.ts'
->>>>>>> 90b204cfe813300d5d7c9898ea1064f029f7699b
     ]
   },
   {
@@ -49,9 +45,6 @@ export default [
       parserOptions: {
         ecmaVersion: 2023,
         sourceType: 'module',
-<<<<<<< 3eaf78dcfc719d1551a4d535699e01b568536167
-        project: ['./.github/linters/tsconfig.json', './tsconfig.json'],
-=======
         projectService: {
           allowDefaultProject: [
             'eslint.config.mjs',
@@ -59,7 +52,6 @@ export default [
             'rollup.config.ts'
           ]
         },
->>>>>>> 90b204cfe813300d5d7c9898ea1064f029f7699b
         tsconfigRootDir: __dirname
       },
       globals: {
@@ -77,11 +69,8 @@ export default [
       'eslint-comments/no-unused-disable': 'off',
       'i18n-text/no-en': 'off',
       'import/no-namespace': 'off',
-<<<<<<< 3eaf78dcfc719d1551a4d535699e01b568536167
-=======
       'import/no-unresolved': 'off',
       'import/extensions': 'off',
->>>>>>> 90b204cfe813300d5d7c9898ea1064f029f7699b
       'no-console': 'off',
       'no-unused-vars': 'off',
       'func-call-spacing': ['error', 'never'],

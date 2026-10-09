@@ -20,7 +20,7 @@ const extractedOutputPath = path.join(
 const createSettings = (
   overrides: Partial<IReleaseDownloadSettings> = {}
 ): IReleaseDownloadSettings => ({
-  sourceRepoPath: 'robinraju/probable-potato',
+  sourceRepoPath: 'step-security/release-downloader',
   isLatest: true,
   preRelease: false,
   tag: '',
@@ -112,8 +112,8 @@ test('logs HTTP authorization errors with a token hint', async () => {
   download.mockRejectedValue(
     new HttpError(
       403,
-      "Fetch latest release for 'robinraju/probable-potato'",
-      'https://api.github.com/repos/robinraju/probable-potato/releases/latest'
+      "Fetch latest release for 'step-security/release-downloader'",
+      'https://api.github.com/repos/step-security/release-downloader/releases/latest'
     )
   )
 
@@ -123,7 +123,7 @@ test('logs HTTP authorization errors with a token hint', async () => {
     expect.stringContaining('HTTP Error:')
   )
   expect(core.error).toHaveBeenCalledWith(
-    '  URL: https://api.github.com/repos/robinraju/probable-potato/releases/latest'
+    '  URL: https://api.github.com/repos/step-security/release-downloader/releases/latest'
   )
   expect(core.error).toHaveBeenCalledWith(
     "  Hint: Verify the 'token' input has appropriate scopes"
@@ -137,8 +137,8 @@ test('logs HTTP not-found errors with a repository hint', async () => {
   download.mockRejectedValue(
     new HttpError(
       404,
-      "Fetch release by tag 'v9.9.9' for 'robinraju/probable-potato'",
-      'https://api.github.com/repos/robinraju/probable-potato/releases/tags/v9.9.9'
+      "Fetch release by tag 'v9.9.9' for 'step-security/release-downloader'",
+      'https://api.github.com/repos/step-security/release-downloader/releases/tags/v9.9.9'
     )
   )
 

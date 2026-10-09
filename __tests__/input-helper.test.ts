@@ -21,7 +21,7 @@ describe('getInputs', () => {
     process.env['GITHUB_WORKSPACE'] = workspacePath
 
     stringInputs = {
-      repository: 'robinraju/probable-potato',
+      repository: 'step-security/release-downloader',
       tag: '',
       releaseId: '',
       fileName: 'test-1.txt',
@@ -59,7 +59,7 @@ describe('getInputs', () => {
     const settings = getInputs()
 
     expect(settings).toEqual({
-      sourceRepoPath: 'robinraju/probable-potato',
+      sourceRepoPath: 'step-security/release-downloader',
       isLatest: true,
       preRelease: false,
       tag: '',

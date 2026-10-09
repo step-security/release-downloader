@@ -19,7 +19,7 @@ import { IHttpClientResponse } from 'typed-rest-client/Interfaces.js'
 const createSettings = (
   overrides: Partial<IReleaseDownloadSettings> = {}
 ): IReleaseDownloadSettings => ({
-  sourceRepoPath: 'robinraju/probable-potato',
+  sourceRepoPath: 'step-security/release-downloader',
   isLatest: true,
   preRelease: false,
   tag: '',
@@ -43,13 +43,13 @@ const createRelease = (
   assets: [
     {
       name: 'test-1.txt',
-      url: 'https://api.github.com/repos/robinraju/probable-potato/releases/assets/1'
+      url: 'https://api.github.com/repos/step-security/release-downloader/releases/assets/1'
     }
   ],
   tarball_url:
-    'https://api.github.com/repos/robinraju/probable-potato/tarball/1.0.0',
+    'https://api.github.com/repos/step-security/release-downloader/tarball/1.0.0',
   zipball_url:
-    'https://api.github.com/repos/robinraju/probable-potato/zipball/1.0.0',
+    'https://api.github.com/repos/step-security/release-downloader/zipball/1.0.0',
   ...overrides
 })
 
@@ -88,7 +88,7 @@ describe('ReleaseDownloader error handling', () => {
 
   test('throws HttpError when the latest release request fails', async () => {
     nock('https://api.github.com')
-      .get('/repos/robinraju/probable-potato/releases/latest')
+      .get('/repos/step-security/release-downloader/releases/latest')
       .reply(404)
 
     await expect(
@@ -98,7 +98,7 @@ describe('ReleaseDownloader error handling', () => {
 
   test('throws HttpError when the release-by-tag request fails', async () => {
     nock('https://api.github.com')
-      .get('/repos/robinraju/probable-potato/releases/tags/v9.9.9')
+      .get('/repos/step-security/release-downloader/releases/tags/v9.9.9')
       .reply(404)
 
     await expect(
@@ -114,7 +114,7 @@ describe('ReleaseDownloader error handling', () => {
 
   test('throws HttpError when the release-by-id request fails', async () => {
     nock('https://api.github.com')
-      .get('/repos/robinraju/probable-potato/releases/999')
+      .get('/repos/step-security/release-downloader/releases/999')
       .reply(404)
 
     await expect(
@@ -130,13 +130,13 @@ describe('ReleaseDownloader error handling', () => {
 
   test('throws HttpError when an asset download fails', async () => {
     nock('https://api.github.com')
-      .get('/repos/robinraju/probable-potato/releases/latest')
+      .get('/repos/step-security/release-downloader/releases/latest')
       .reply(200, createRelease())
 
     nock('https://api.github.com', {
       reqheaders: { accept: 'application/octet-stream' }
     })
-      .get('/repos/robinraju/probable-potato/releases/assets/1')
+      .get('/repos/step-security/release-downloader/releases/assets/1')
       .reply(404)
 
     await expect(
@@ -146,14 +146,14 @@ describe('ReleaseDownloader error handling', () => {
 
   test('supports valid zero-byte assets', async () => {
     nock('https://api.github.com')
-      .get('/repos/robinraju/empty-assets/releases/latest')
+      .get('/repos/step-security/empty-assets/releases/latest')
       .reply(
         200,
         createRelease({
           assets: [
             {
               name: 'empty.txt',
-              url: 'https://api.github.com/repos/robinraju/empty-assets/releases/assets/1'
+              url: 'https://api.github.com/repos/step-security/empty-assets/releases/assets/1'
             }
           ]
         })
@@ -162,12 +162,12 @@ describe('ReleaseDownloader error handling', () => {
     nock('https://api.github.com', {
       reqheaders: { accept: 'application/octet-stream' }
     })
-      .get('/repos/robinraju/empty-assets/releases/assets/1')
+      .get('/repos/step-security/empty-assets/releases/assets/1')
       .reply(200, '')
 
     const result = await downloader.download(
       createSettings({
-        sourceRepoPath: 'robinraju/empty-assets',
+        sourceRepoPath: 'step-security/empty-assets',
         fileName: 'empty.txt',
         outFilePath: outputFilePath
       })
@@ -183,13 +183,13 @@ describe('ReleaseDownloader error handling', () => {
     fs.writeFileSync(blockingPath, 'blocked')
 
     nock('https://api.github.com')
-      .get('/repos/robinraju/probable-potato/releases/latest')
+      .get('/repos/step-security/release-downloader/releases/latest')
       .reply(200, createRelease())
 
     nock('https://api.github.com', {
       reqheaders: { accept: 'application/octet-stream' }
     })
-      .get('/repos/robinraju/probable-potato/releases/assets/1')
+      .get('/repos/step-security/release-downloader/releases/assets/1')
       .reply(200, 'downloaded data')
 
     await expect(

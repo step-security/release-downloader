@@ -1,6 +1,7 @@
 // See: https://rollupjs.org/introduction/
 
 import commonjs from '@rollup/plugin-commonjs'
+import json from '@rollup/plugin-json'
 import nodeResolve from '@rollup/plugin-node-resolve'
 import typescript from '@rollup/plugin-typescript'
 
@@ -13,7 +14,12 @@ const config = {
     sourcemap: true,
     inlineDynamicImports: true
   },
-  plugins: [typescript(), nodeResolve({ preferBuiltins: true }), commonjs()],
+  plugins: [
+    typescript(),
+    nodeResolve({ preferBuiltins: true }),
+    commonjs(),
+    json()
+  ],
   onwarn(warning, defaultHandler) {
     if (warning.code === 'CIRCULAR_DEPENDENCY') return
     if (warning.code === 'THIS_IS_UNDEFINED') return

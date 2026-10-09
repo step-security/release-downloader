@@ -11,7 +11,7 @@ import { FileNotFoundError } from '../src/errors.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const tarX = jest.fn<typeof tar.x>(tar.x as never)
+const tarX = jest.fn<typeof tar.x>(tar.x)
 
 jest.unstable_mockModule('@actions/core', () => core)
 jest.unstable_mockModule('tar', () => ({ ...tar, x: tarX }))
@@ -26,7 +26,7 @@ describe('extract', () => {
 
   beforeEach(() => {
     testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'release-downloader-'))
-    tarX.mockImplementation(tar.x as never)
+    tarX.mockImplementation(tar.x)
   })
 
   afterEach(async () => {

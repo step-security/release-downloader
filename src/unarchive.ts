@@ -37,37 +37,47 @@ export const extract = async (
     fs.mkdirSync(destDir, { recursive: true })
   }
 
-<<<<<<< 3eaf78dcfc719d1551a4d535699e01b568536167
   const resolvedDest = path.resolve(destDir)
+  const isInsideDest = (resolved: string): boolean =>
+    resolved === resolvedDest || resolved.startsWith(resolvedDest + path.sep)
 
-  // Extract the file to the destination directory
-  if (isTarGz) {
-    await tar.x({
-      file: filePath,
-      cwd: destDir,
-      filter: (entryPath: string) => {
-        const resolved = path.resolve(destDir, entryPath)
-        if (
-          !resolved.startsWith(resolvedDest + path.sep) &&
-          resolved !== resolvedDest
-        ) {
-          core.warning(`Skipping tar entry with path traversal: ${entryPath}`)
-          return false
-        }
-        return true
-=======
   try {
     // Extract the file to the destination directory
     if (isTarGz) {
       await tar.x({
         file: filePath,
-        cwd: destDir
+        cwd: destDir,
+        filter: (entryPath: string) => {
+          if (!isInsideDest(path.resolve(destDir, entryPath))) {
+            core.warning(`Skipping tar entry with path traversal: ${entryPath}`)
+            return false
+          }
+          return true
+        }
       })
     }
     if (isZip) {
       const zip = new StreamZip.async({ file: filePath })
-      await zip.extract(null, destDir)
-      await zip.close()
+      try {
+        const entries = await zip.entries()
+        for (const entry of Object.values(entries)) {
+          const resolved = path.resolve(destDir, entry.name)
+          if (!isInsideDest(resolved)) {
+            core.warning(
+              `Skipping zip entry with path traversal: ${entry.name}`
+            )
+            continue
+          }
+          if (entry.isDirectory) {
+            fs.mkdirSync(resolved, { recursive: true })
+          } else {
+            fs.mkdirSync(path.dirname(resolved), { recursive: true })
+            await zip.extract(entry.name, resolved)
+          }
+        }
+      } finally {
+        await zip.close()
+      }
     }
 
     fs.rm(filePath, err => {
@@ -75,7 +85,6 @@ export const extract = async (
         core.warning(
           `Failed to delete archive ${filename} after extraction: ${err.message}`
         )
->>>>>>> 90b204cfe813300d5d7c9898ea1064f029f7699b
       }
     })
     core.info(`Extracted ${filename} to ${destDir}`)
@@ -94,32 +103,4 @@ export const extract = async (
       { filePath, destDir }
     )
   }
-<<<<<<< 3eaf78dcfc719d1551a4d535699e01b568536167
-  if (isZip) {
-    const zip = new StreamZip.async({ file: filePath })
-    const entries = await zip.entries()
-    for (const entry of Object.values(entries)) {
-      const resolved = path.resolve(destDir, entry.name)
-      if (
-        !resolved.startsWith(resolvedDest + path.sep) &&
-        resolved !== resolvedDest
-      ) {
-        core.warning(`Skipping zip entry with path traversal: ${entry.name}`)
-        continue
-      }
-      if (entry.isDirectory) {
-        fs.mkdirSync(resolved, { recursive: true })
-      } else {
-        const dir = path.dirname(resolved)
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true })
-        }
-        await zip.extract(entry.name, resolved)
-      }
-    }
-    await zip.close()
-  }
-  core.info(`Extracted ${filename} to ${destDir}`)
-=======
->>>>>>> 90b204cfe813300d5d7c9898ea1064f029f7699b
 }
